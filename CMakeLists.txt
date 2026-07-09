@@ -10,6 +10,17 @@ set(TARGET_NAME gorz)
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 
+# vcpkg's static triplet (used by the community CI) exports zstd::libzstd_static;
+# a shared build (e.g. homebrew) exports zstd::libzstd. Resolve whichever exists
+# into one variable used for both the include-order fix and linking below.
+if(TARGET zstd::libzstd)
+    set(GORZ_ZSTD_TARGET zstd::libzstd)
+elseif(TARGET zstd::libzstd_static)
+    set(GORZ_ZSTD_TARGET zstd::libzstd_static)
+else()
+    message(FATAL_ERROR "zstd found but neither zstd::libzstd nor zstd::libzstd_static target exists")
+endif()
+
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
@@ -58,7 +69,7 @@ target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -std=c++17)
 # Cellar path behind the /opt/homebrew/include symlink — and prepend that with
 # BEFORE, which then actually sorts ahead of third_party. In a vcpkg build the
 # include dir is already project-local, so this just re-points at the same place.
-foreach(dep zstd::libzstd ZLIB::ZLIB)
+foreach(dep ${GORZ_ZSTD_TARGET} ZLIB::ZLIB)
     get_target_property(_inc ${dep} INTERFACE_INCLUDE_DIRECTORIES)
     foreach(_d ${_inc})
         foreach(_h zstd.h zlib.h)
@@ -73,8 +84,8 @@ foreach(dep zstd::libzstd ZLIB::ZLIB)
 endforeach()
 
 # Link zlib + zstd into both the static library and the loadable extension.
-target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB $<IF:$<TARGET_EXISTS:zstd::libzstd>,zstd::libzstd,zstd::libzstd_static>)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB $<IF:$<TARGET_EXISTS:zstd::libzstd>,zstd::libzstd,zstd::libzstd_static>)
+target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB ${GORZ_ZSTD_TARGET})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB ${GORZ_ZSTD_TARGET})
 
 install(
   TARGETS ${EXTENSION_NAME}
