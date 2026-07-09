@@ -1,0 +1,74 @@
+# name: test/sql/gorz.test
+# description: read/write GORpipe .gorz via the gorz extension (self-contained — writes its own fixtures with COPY)
+# group: [gorz]
+
+# Before the extension loads, the table function doesn't exist.
+statement error
+SELECT count(*) FROM read_gor('x.gorz');
+----
+Catalog Error
+
+require gorz
+
+# --- write then read back a .gorz (round-trip) -------------------------------
+# Note chr1 < chr10 < chr2 (GOR's lexicographic chromosome order).
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1', 1, 'A'), ('chr1', 2, 'C'), ('chr10', 3, 'G'), ('chr2', 5, 'T'))
+        t(chrom, pos, ref) ORDER BY chrom, pos)
+  TO '__TEST_DIR__/g.gorz' (FORMAT gorz);
+
+query I
+SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz');
+----
+4
+
+query TTT
+SELECT chrom, CAST(pos AS VARCHAR), ref FROM read_gor('__TEST_DIR__/g.gorz') ORDER BY chrom, pos;
+----
+chr1	1	A
+chr1	2	C
+chr10	3	G
+chr2	5	T
+
+# read_gorz forces the GORZ kind.
+query I
+SELECT count(*) FROM read_gorz('__TEST_DIR__/g.gorz');
+----
+4
+
+# Replacement scan: a bare '...gorz' literal resolves to read_gor(...).
+query I
+SELECT count(*) FROM '__TEST_DIR__/g.gorz';
+----
+4
+
+# --- plain FORMAT gor writes a valid GOR text file ---------------------------
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1', 1, 'A'), ('chr2', 9, 'G')) t(chrom, pos, ref) ORDER BY chrom, pos)
+  TO '__TEST_DIR__/g.gor' (FORMAT gor);
+
+# The header line is the column names, tab-separated (no leading '#').
+query I
+SELECT count(*) FROM read_csv('__TEST_DIR__/g.gor', delim='\t', header=true);
+----
+2
+
+# --- order validation: unordered input must error ----------------------------
+statement error
+COPY (SELECT * FROM (VALUES ('chr2', 5, 'T'), ('chr1', 1, 'A')) t(chrom, pos, ref))
+  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+----
+Wrong chromosome order in gor stream
+
+statement error
+COPY (SELECT * FROM (VALUES ('chr1', 10, 'T'), ('chr1', 2, 'A')) t(chrom, pos, ref))
+  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+----
+Wrong order in gor stream
+
+# --- bind-time schema errors -------------------------------------------------
+statement error
+COPY (SELECT * FROM (VALUES ('chr1', 'x', 'A')) t(chrom, pos, ref))
+  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+----
+must be an integer type
