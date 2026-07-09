@@ -76,20 +76,15 @@ target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -std=c++17)
 # BEFORE, which then actually sorts ahead of third_party. In a vcpkg build the
 # include dir is already project-local, so this just re-points at the same
 # place.
-foreach(dep ${GORZ_ZSTD_TARGET} ZLIB::ZLIB)
-  get_target_property(_inc ${dep} INTERFACE_INCLUDE_DIRECTORIES)
-  foreach(_d ${_inc})
-    foreach(_h zstd.h zlib.h)
-      if(EXISTS "${_d}/${_h}")
-        get_filename_component(_real "${_d}/${_h}" REALPATH)
-        get_filename_component(_realdir "${_real}" DIRECTORY)
-        target_include_directories(${EXTENSION_NAME} BEFORE
-                                   PRIVATE "${_realdir}")
-        target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE
-                                   PRIVATE "${_realdir}")
-      endif()
-    endforeach()
-  endforeach()
+foreach(_h zstd zlib)
+  find_path(GORZ_${_h}_INC NAMES ${_h}.h)
+  if(GORZ_${_h}_INC)
+    get_filename_component(_real "${GORZ_${_h}_INC}/${_h}.h" REALPATH)
+    get_filename_component(_realdir "${_real}" DIRECTORY)
+    target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE "${_realdir}")
+    target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE
+                               PRIVATE "${_realdir}")
+  endif()
 endforeach()
 
 # Link zlib + zstd into both the static library and the loadable extension.
