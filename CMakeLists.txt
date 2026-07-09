@@ -5,20 +5,24 @@ set(TARGET_NAME gorz)
 
 # The GORZ block codec needs zlib (deflate, read+write) and zstd (read of
 # zstd-flagged blocks). Both come from vcpkg (see vcpkg.json) and link
-# statically into the extension with hidden visibility, so they don't clash
-# with DuckDB's own vendored copies.
+# statically into the extension with hidden visibility, so they don't clash with
+# DuckDB's own vendored copies.
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 
-# vcpkg's static triplet (used by the community CI) exports zstd::libzstd_static;
-# a shared build (e.g. homebrew) exports zstd::libzstd. Resolve whichever exists
-# into one variable used for both the include-order fix and linking below.
+# vcpkg's static triplet (used by the community CI) exports
+# zstd::libzstd_static; a shared build (e.g. homebrew) exports zstd::libzstd.
+# Resolve whichever exists into one variable used for both the include-order fix
+# and linking below.
 if(TARGET zstd::libzstd)
-    set(GORZ_ZSTD_TARGET zstd::libzstd)
+  set(GORZ_ZSTD_TARGET zstd::libzstd)
 elseif(TARGET zstd::libzstd_static)
-    set(GORZ_ZSTD_TARGET zstd::libzstd_static)
+  set(GORZ_ZSTD_TARGET zstd::libzstd_static)
 else()
-    message(FATAL_ERROR "zstd found but neither zstd::libzstd nor zstd::libzstd_static target exists")
+  message(
+    FATAL_ERROR
+      "zstd found but neither zstd::libzstd nor zstd::libzstd_static target exists"
+  )
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -26,7 +30,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD
+    "17"
+    CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # src/include: the extension header. lib/gorz/include: the DuckDB-independent
@@ -63,24 +69,27 @@ target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -std=c++17)
 # the include path, so a bare <zstd.h> binds to DuckDB's copy and lib/gorz's
 # global ZSTD_* calls don't resolve. A plain BEFORE prepend of the dep's include
 # dir doesn't win when that dir is a system prefix (e.g. /opt/homebrew/include):
-# CMake demotes it below the third_party dirs, and a raw -I compile flag lands in
-# CXX_FLAGS, which this generator places *after* CXX_INCLUDES. So resolve
+# CMake demotes it below the third_party dirs, and a raw -I compile flag lands
+# in CXX_FLAGS, which this generator places *after* CXX_INCLUDES. So resolve
 # zstd.h / zlib.h to their REAL (non-system) directory — e.g. the homebrew
 # Cellar path behind the /opt/homebrew/include symlink — and prepend that with
 # BEFORE, which then actually sorts ahead of third_party. In a vcpkg build the
-# include dir is already project-local, so this just re-points at the same place.
+# include dir is already project-local, so this just re-points at the same
+# place.
 foreach(dep ${GORZ_ZSTD_TARGET} ZLIB::ZLIB)
-    get_target_property(_inc ${dep} INTERFACE_INCLUDE_DIRECTORIES)
-    foreach(_d ${_inc})
-        foreach(_h zstd.h zlib.h)
-            if(EXISTS "${_d}/${_h}")
-                get_filename_component(_real "${_d}/${_h}" REALPATH)
-                get_filename_component(_realdir "${_real}" DIRECTORY)
-                target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE "${_realdir}")
-                target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE "${_realdir}")
-            endif()
-        endforeach()
+  get_target_property(_inc ${dep} INTERFACE_INCLUDE_DIRECTORIES)
+  foreach(_d ${_inc})
+    foreach(_h zstd.h zlib.h)
+      if(EXISTS "${_d}/${_h}")
+        get_filename_component(_real "${_d}/${_h}" REALPATH)
+        get_filename_component(_realdir "${_real}" DIRECTORY)
+        target_include_directories(${EXTENSION_NAME} BEFORE
+                                   PRIVATE "${_realdir}")
+        target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE
+                                   PRIVATE "${_realdir}")
+      endif()
     endforeach()
+  endforeach()
 endforeach()
 
 # Link zlib + zstd into both the static library and the loadable extension.
