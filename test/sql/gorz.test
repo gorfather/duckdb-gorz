@@ -1,6 +1,6 @@
 # name: test/sql/gorz.test
 # description: read/write GORpipe .gorz via the gorz extension (self-contained — writes its own fixtures with COPY)
-# group: [gorz]
+# group: [sql]
 
 # Before the extension loads, the table function doesn't exist.
 statement error
