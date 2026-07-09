@@ -42,6 +42,40 @@ SELECT count(*) FROM '__TEST_DIR__/g.gorz';
 ----
 4
 
+# range := 'chrN[:a-b]' — GOR -p style hard filter (fixture: chr1:1, chr1:2, chr10:3, chr2:5).
+query I
+SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1');
+----
+2
+
+query TT
+SELECT chrom, CAST(pos AS VARCHAR) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1:1-1');
+----
+chr1	1
+
+query T
+SELECT chrom FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr2');
+----
+chr2
+
+# range intersects with WHERE (both applied).
+query I
+SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1') WHERE pos = 2;
+----
+1
+
+# a chromosome absent from the file yields no rows.
+query I
+SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chrZ');
+----
+0
+
+# malformed range spec errors at bind.
+statement error
+SELECT * FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1:oops');
+----
+bad position
+
 # --- plain FORMAT gor writes a valid GOR text file ---------------------------
 statement ok
 COPY (SELECT * FROM (VALUES ('chr1', 1, 'A'), ('chr2', 9, 'G')) t(chrom, pos, ref) ORDER BY chrom, pos)

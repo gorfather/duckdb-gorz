@@ -6,7 +6,8 @@
 //
 // Registers at LOAD time:
 //   * read_gor / read_gorz / read_gord table functions (projection pushdown,
-//     parallel scan, f/ff partition filters, WHERE->block-seek pushdown).
+//     parallel scan, f/ff partition filters, range := 'chrN:a-b' hard filter,
+//     WHERE->block-seek pushdown).
 //   * a replacement scan rewriting 'foo.gorz' / 'foo.gord' literals to
 //     read_gor(...), like DuckDB's .csv / .parquet auto-detect.
 //   * COPY TO (FORMAT gorz | gor) write functions.
@@ -102,6 +103,12 @@ struct GorBindData : public TableFunctionData {
     // GOR -f / -ff partition filter: the union of the requested tags. Empty →
     // no tag filtering. Only valid for the GORD kind (validated at bind).
     std::vector<std::string> tagFilter;
+    // GOR -p style HARD range from the `range` named parameter
+    // ('chrN' | 'chrN:start-end' | 'chrN:start-' | 'chrN:pos'). Unlike `seek`
+    // (a soft pushdown hint that DuckDB re-checks), this bounds which rows the
+    // scan emits. Intersected with `seek` in init_global (see effectiveSeek).
+    bool haveRangeParam = false;
+    SeekHint rangeParam;
 };
 
 // One-per-query state: holds the open file + reader. DuckDB calls Execute
@@ -620,6 +627,78 @@ void collectTagParam(TableFunctionBindInput &input, const char *name,
     }
 }
 
+// Parse a GOR -p style range spec into a SeekHint (positions 1-based inclusive,
+// the GOR convention). Accepted forms:
+//   'chrN'            whole chromosome
+//   'chrN:start-end'  inclusive window
+//   'chrN:start-'     start..end-of-chrom
+//   'chrN:-end'       chrom-start..end
+//   'chrN:pos'        the single position pos
+// Throws BinderException on a malformed spec.
+SeekHint parseRangeParam(const std::string &spec) {
+    SeekHint h;
+    auto parseInt = [&](const std::string &t) -> int64_t {
+        try {
+            size_t idx = 0;
+            long long v = std::stoll(t, &idx);
+            if (idx != t.size() || v < 0) throw std::invalid_argument("");
+            return static_cast<int64_t>(v);
+        } catch (...) {
+            throw BinderException("read_gor: range: bad position '" + t + "' in '" + spec + "'");
+        }
+    };
+    auto colon = spec.find(':');
+    std::string chrom = (colon == std::string::npos) ? spec : spec.substr(0, colon);
+    if (chrom.empty()) {
+        throw BinderException("read_gor: range: empty chromosome in '" + spec + "'");
+    }
+    h.chrom = chrom;
+    h.haveChrom = true;
+    if (colon == std::string::npos) return h;  // whole chromosome
+
+    std::string rest = spec.substr(colon + 1);
+    auto dash = rest.find('-');
+    if (dash == std::string::npos) {  // 'chrN:pos' → single position
+        if (rest.empty()) throw BinderException("read_gor: range: empty position in '" + spec + "'");
+        h.posLo = h.posHi = parseInt(rest);
+        h.haveLo = h.haveHi = true;
+        return h;
+    }
+    std::string lo = rest.substr(0, dash);
+    std::string hi = rest.substr(dash + 1);
+    if (!lo.empty()) { h.posLo = parseInt(lo); h.haveLo = true; }
+    if (!hi.empty()) { h.posHi = parseInt(hi); h.haveHi = true; }
+    if (h.haveLo && h.haveHi && h.posHi < h.posLo) {
+        throw BinderException("read_gor: range: end < start in '" + spec + "'");
+    }
+    return h;
+}
+
+// The effective seek window for a bound query: the pushdown hint (`seek`)
+// intersected with the hard `range` parameter. When `range` names a different
+// chromosome than the pushdown found, the pushdown's pos bounds are dropped
+// (they belong to another chromosome; the result is empty and DuckDB's WHERE
+// enforces that). `range`'s chromosome is authoritative.
+SeekHint effectiveSeek(const GorBindData &bind) {
+    SeekHint eff = bind.seek;
+    if (!bind.haveRangeParam) return eff;
+    const SeekHint &rp = bind.rangeParam;
+    if (bind.seek.haveChrom && bind.seek.chrom != rp.chrom) {
+        return rp;  // pushdown is for another chrom → use the param window
+    }
+    eff.chrom = rp.chrom;
+    eff.haveChrom = true;
+    if (rp.haveLo) {
+        eff.posLo = eff.haveLo ? std::max(eff.posLo, rp.posLo) : rp.posLo;
+        eff.haveLo = true;
+    }
+    if (rp.haveHi) {
+        eff.posHi = eff.haveHi ? std::min(eff.posHi, rp.posHi) : rp.posHi;
+        eff.haveHi = true;
+    }
+    return eff;
+}
+
 // Shared bind for read_gor / read_gorz / read_gord. Resolves the path,
 // determines the kind (forced by read_gorz/read_gord, else by extension for
 // read_gor), and discovers columns + types for that kind — filling
@@ -644,6 +723,16 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
     // GOR -f / -ff partition filter (union of both). Only valid for .gord.
     collectTagParam(input, "f", data->tagFilter);
     collectTagParam(input, "ff", data->tagFilter);
+
+    // GOR -p style hard range: 'chrN' | 'chrN:start-end'. Applies to both kinds.
+    auto rangeIt = input.named_parameters.find("range");
+    if (rangeIt != input.named_parameters.end() && !rangeIt->second.IsNull()) {
+        std::string spec = rangeIt->second.ToString();
+        if (!spec.empty()) {
+            data->rangeParam = parseRangeParam(spec);
+            data->haveRangeParam = true;
+        }
+    }
     if (!data->tagFilter.empty() && kind != GorKind::GORD) {
         throw BinderException(
             "read_gor: f / ff partition filtering only applies to .gord dictionaries");
@@ -722,6 +811,8 @@ ReadGorInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->Cast<GorBindData>();
     auto state = make_uniq<GorGlobalState>();
     state->kind = bind.kind;
+    // Effective window = pushdown seek hint ∩ the hard `range` parameter.
+    SeekHint eff = effectiveSeek(bind);
     // Projection pushdown: the columns DuckDB wants, in output order.
     state->projection = input.column_ids;
     auto fsOpener = makeFsOpener(context);
@@ -734,13 +825,13 @@ ReadGorInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         state->opener = fsOpener;
         state->gordColumns = gord.columns.empty() ? bind.columnNames : gord.columns;
         state->gordHasTags = gord.hasTags;
-        state->gordHaveRange = bind.seek.haveChrom;
-        if (bind.seek.haveChrom) {
-            state->gordChrom = bind.seek.chrom;
-            state->gordPosLo = bind.seek.haveLo ? bind.seek.posLo
-                                                : std::numeric_limits<int64_t>::min() / 2;
-            state->gordPosHi = bind.seek.haveHi ? bind.seek.posHi
-                                                : std::numeric_limits<int64_t>::max() / 2;
+        state->gordHaveRange = eff.haveChrom;
+        if (eff.haveChrom) {
+            state->gordChrom = eff.chrom;
+            state->gordPosLo = eff.haveLo ? eff.posLo
+                                          : std::numeric_limits<int64_t>::min() / 2;
+            state->gordPosHi = eff.haveHi ? eff.posHi
+                                          : std::numeric_limits<int64_t>::max() / 2;
         }
         state->gordTags = bind.tagFilter;
 
@@ -776,7 +867,7 @@ ReadGorInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     // read in parallel.
     state->gorzPath = bind.path;
     state->opener = fsOpener;
-    const bool hasSeek = bind.seek.haveChrom || bind.seek.haveLo || bind.seek.haveHi;
+    const bool hasSeek = eff.haveChrom || eff.haveLo || eff.haveHi;
     if (!hasSeek) {
         // Probe body-start + file size to plan the split.
         auto probe = openViaFileSystem(context, bind.path, "read_gor");
@@ -823,13 +914,13 @@ ReadGorInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     // seek and set the Execute-side short-circuit (stop once we walk past the
     // target chrom). Best-effort: seekTo is no-throw and the short-circuit
     // keeps results correct even when no .gori is present.
-    state->chromEq = bind.seek.chrom;
-    state->haveChromEq = bind.seek.haveChrom;
-    state->posLo = bind.seek.posLo;
-    state->posHi = bind.seek.posHi;
-    state->rangeActive = state->haveChromEq || bind.seek.haveLo || bind.seek.haveHi;
+    state->chromEq = eff.chrom;
+    state->haveChromEq = eff.haveChrom;
+    state->posLo = eff.posLo;
+    state->posHi = eff.posHi;
+    state->rangeActive = state->haveChromEq || eff.haveLo || eff.haveHi;
     if (state->haveChromEq) {
-        int64_t seekPos = bind.seek.haveLo ? bind.seek.posLo : 0;
+        int64_t seekPos = eff.haveLo ? eff.posLo : 0;
         try {
             state->reader->seekTo(state->chromEq, seekPos);
         } catch (const std::exception&) {
@@ -1323,6 +1414,8 @@ void LoadInternal(ExtensionLoader &loader) {
         auto tagList = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
         tf.named_parameters["f"] = tagList;
         tf.named_parameters["ff"] = tagList;
+        // GOR -p style hard range: range := 'chrN' | 'chrN:start-end'.
+        tf.named_parameters["range"] = duckdb::LogicalType::VARCHAR;
         loader.RegisterFunction(tf);
     };
     registerGor("read_gor", duckdb::ReadGorBind);
