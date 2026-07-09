@@ -37,6 +37,41 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# lib/gorz uses C++17 (std::optional, std::make_unique). DuckDB's extension
+# build injects -std=c++11 into the global flags (its own parquet extension
+# builds c++11 too), which overrides CMAKE_CXX_STANDARD. Append -std=c++17 to
+# our targets specifically — it lands after the c++11 in the compile line, and
+# clang honours the last -std. Only our TUs are affected; the DuckDB ABI
+# boundary uses DuckDB's own types, so the mixed standard is safe.
+target_compile_features(${EXTENSION_NAME} PUBLIC cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PUBLIC cxx_std_17)
+target_compile_options(${EXTENSION_NAME} PRIVATE -std=c++17)
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -std=c++17)
+
+# DuckDB puts its vendored, namespaced third_party/zstd (duckdb_zstd) early on
+# the include path, so a bare <zstd.h> binds to DuckDB's copy and lib/gorz's
+# global ZSTD_* calls don't resolve. A plain BEFORE prepend of the dep's include
+# dir doesn't win when that dir is a system prefix (e.g. /opt/homebrew/include):
+# CMake demotes it below the third_party dirs, and a raw -I compile flag lands in
+# CXX_FLAGS, which this generator places *after* CXX_INCLUDES. So resolve
+# zstd.h / zlib.h to their REAL (non-system) directory — e.g. the homebrew
+# Cellar path behind the /opt/homebrew/include symlink — and prepend that with
+# BEFORE, which then actually sorts ahead of third_party. In a vcpkg build the
+# include dir is already project-local, so this just re-points at the same place.
+foreach(dep zstd::libzstd ZLIB::ZLIB)
+    get_target_property(_inc ${dep} INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(_d ${_inc})
+        foreach(_h zstd.h zlib.h)
+            if(EXISTS "${_d}/${_h}")
+                get_filename_component(_real "${_d}/${_h}" REALPATH)
+                get_filename_component(_realdir "${_real}" DIRECTORY)
+                target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE "${_realdir}")
+                target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE "${_realdir}")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
+
 # Link zlib + zstd into both the static library and the loadable extension.
 target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB $<IF:$<TARGET_EXISTS:zstd::libzstd>,zstd::libzstd,zstd::libzstd_static>)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB $<IF:$<TARGET_EXISTS:zstd::libzstd>,zstd::libzstd,zstd::libzstd_static>)
