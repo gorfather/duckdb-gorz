@@ -5,6 +5,15 @@
 
 #include <cstring>
 
+#ifdef GORZ_DUCKDB_ZSTD
+// Building inside the DuckDB extension: <zstd.h> resolves to DuckDB's vendored,
+// namespaced copy (duckdb_zstd) — which sits first on the extension's include
+// path and can't reliably be overridden. Reuse it (as DuckDB's own parquet
+// extension does) instead of pulling in a separate zstd: bring its names into
+// scope so the standard ZSTD_* calls below bind to duckdb_zstd::ZSTD_*.
+using namespace duckdb_zstd;
+#endif
+
 namespace gorz {
 
 std::vector<uint8_t> inflate_zlib(const uint8_t* src, std::size_t srcLen,

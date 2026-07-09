@@ -1,7 +1,6 @@
 {
     "dependencies": [
-        "zlib",
-        "zstd"
+        "zlib"
     ],
     "vcpkg-configuration": {
         "overlay-ports": [
