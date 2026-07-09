@@ -19,6 +19,11 @@ jobs:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: gorz
+      # linux_arm64 excluded: DuckDB v1.5.4 fails to build its own plan_serializer
+      # tool on the arm64 gcc-toolset-14 image (multiple definition of
+      # BufferedFileWriter::DEFAULT_OPEN_FLAGS) — an upstream toolchain issue, not
+      # this extension. Re-enable once the arm64 build image / DuckDB is fixed.
+      exclude_archs: 'linux_arm64'
 
   code-quality-check:
     name: Code Quality Check
