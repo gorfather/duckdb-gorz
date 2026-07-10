@@ -1,0 +1,121 @@
+# name: test/sql/gord.test
+# description: read GORpipe .gord dictionaries — bucketization + the exposed Source column (self-contained — writes its own .gorz sources, bucket and .gord with COPY)
+# group: [sql]
+
+require gorz
+
+# --- build a bucketized dictionary entirely with COPY ------------------------
+# 4 single-tag source files s1..s4 (schema chrom pos val)...
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1',10,'A'),('chr1',50,'A')) t(chrom,pos,val) ORDER BY chrom,pos)
+  TO '__TEST_DIR__/s1.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1',20,'B'),('chr1',60,'B')) t(chrom,pos,val) ORDER BY chrom,pos)
+  TO '__TEST_DIR__/s2.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1',30,'C'),('chr1',70,'C')) t(chrom,pos,val) ORDER BY chrom,pos)
+  TO '__TEST_DIR__/s3.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1',40,'D'),('chr1',80,'D')) t(chrom,pos,val) ORDER BY chrom,pos)
+  TO '__TEST_DIR__/s4.gorz' (FORMAT gorz);
+
+# ...all tiled into one bucket file that carries the trailing Source column.
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('chr1',10,'A','s1'),('chr1',20,'B','s2'),('chr1',30,'C','s3'),('chr1',40,'D','s4'),
+    ('chr1',50,'A','s1'),('chr1',60,'B','s2'),('chr1',70,'C','s3'),('chr1',80,'D','s4'))
+    t(chrom,pos,val,Source) ORDER BY chrom,pos)
+  TO '__TEST_DIR__/b1.gorz' (FORMAT gorz);
+
+# The dictionary: <src>|<bucket> lines, with s3 marked deleted via <src>|D|<bucket>.
+# Written as a plain TSV — the pipe-bearing file column is just a string value.
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('s1.gorz|b1.gorz',  's1','chr1',1,'chr1',1000000),
+    ('s2.gorz|b1.gorz',  's2','chr1',1,'chr1',1000000),
+    ('s3.gorz|D|b1.gorz','s3','chr1',1,'chr1',1000000),
+    ('s4.gorz|b1.gorz',  's4','chr1',1,'chr1',1000000)) t(f,tag,cs,ps,ce,pe))
+  TO '__TEST_DIR__/d.gord' (FORMAT csv, DELIMITER E'\t', HEADER false);
+
+# --- full scan → bucket chosen; s3 (deleted) rows dropped --------------------
+# The exposed Source column is the trailing column: bucket rows carry it,
+# and single-tag primaries have their tag appended to match (GOR insertSource).
+query TITT
+SELECT chrom, pos, val, Source FROM read_gord('__TEST_DIR__/d.gord') ORDER BY pos;
+----
+chr1	10	A	s1
+chr1	20	B	s2
+chr1	40	D	s4
+chr1	50	A	s1
+chr1	60	B	s2
+chr1	80	D	s4
+
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord');
+----
+6
+
+# The trailing column defaults to the name "Source".
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_gord('__TEST_DIR__/d.gord')) LIMIT 1 OFFSET 3;
+----
+Source
+
+# The `source` parameter (GOR's -s) renames it.
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_gord('__TEST_DIR__/d.gord', source := 'PN')) LIMIT 1 OFFSET 3;
+----
+PN
+
+# --- partition filtering (-f / -ff) -----------------------------------------
+# Subset that trips the bucket (2/4 tags > 40%): only s1, s2 rows.
+query TITT
+SELECT chrom, pos, val, Source FROM read_gord('__TEST_DIR__/d.gord', f := ['s1','s2']) ORDER BY pos;
+----
+chr1	10	A	s1
+chr1	20	B	s2
+chr1	50	A	s1
+chr1	60	B	s2
+
+# Single tag → the individual file (bucket's count==1 guard), not the bucket.
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1']);
+----
+2
+
+# Naming the deleted tag alongside live ones still drops its stale bucket rows.
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1','s2','s3']);
+----
+4
+
+# Silent filtering (SQL default): unknown or deleted-only tags → no rows, no error.
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['nope']);
+----
+0
+
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s3']);
+----
+0
+
+# --- composes with range and WHERE ------------------------------------------
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', range := 'chr1:15-55');
+----
+3
+
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1','s2']) WHERE val = 'A';
+----
+2
+
+# Filtering on the exposed Source column works like any other column.
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord') WHERE Source = 's4';
+----
+2
