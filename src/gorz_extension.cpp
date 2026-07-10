@@ -109,6 +109,10 @@ struct GorBindData : public TableFunctionData {
 	// scan emits. Intersected with `seek` in init_global (see effectiveSeek).
 	bool haveRangeParam = false;
 	SeekHint rangeParam;
+	// Explicit source-column name from the `source` named parameter (GOR's -s).
+	// Empty → resolve from the dictionary (## SOURCE_COLUMN / header) then
+	// "Source". Only meaningful for the GORD kind.
+	std::string sourceName;
 };
 
 // One-per-query state: holds the open file + reader. DuckDB calls Execute
@@ -782,6 +786,12 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 	collectTagParam(input, "f", data->tagFilter);
 	collectTagParam(input, "ff", data->tagFilter);
 
+	// GOR -s: rename the exposed source column. Only meaningful for .gord.
+	auto srcIt = input.named_parameters.find("source");
+	if (srcIt != input.named_parameters.end() && !srcIt->second.IsNull()) {
+		data->sourceName = srcIt->second.ToString();
+	}
+
 	// GOR -p style hard range: 'chrN' | 'chrN:start-end'. Applies to both kinds.
 	auto rangeIt = input.named_parameters.find("range");
 	if (rangeIt != input.named_parameters.end() && !rangeIt->second.IsNull()) {
@@ -841,6 +851,26 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 		}
 		gorz::GorMeta meta = gorz::parseMetaFile(gord.entries.front().path + ".meta", fsOpener);
 		finishColumns(meta);
+		// Expose the trailing Source column. Every emitted row carries it: bucket
+		// rows already do, and GordReader appends the tag for single-tag primaries
+		// so both come out at this width. Name resolution mirrors GOR's -s chain:
+		//   `source` param  >  <dict>.meta SOURCE_COLUMN  >  dict header  >  "Source".
+		std::string sourceCol = data->sourceName;
+		if (sourceCol.empty()) {
+			gorz::GorMeta dictMeta = gorz::parseMetaFile(path + ".meta", fsOpener);
+			auto sc = dictMeta.properties.find("SOURCE_COLUMN");
+			if (sc != dictMeta.properties.end() && !sc->second.empty()) {
+				sourceCol = sc->second;
+			}
+		}
+		if (sourceCol.empty())
+			sourceCol = gord.sourceColumnName;
+		if (sourceCol.empty())
+			sourceCol = "Source";
+		data->columnNames.push_back(sourceCol);
+		data->columnTypes.push_back(LogicalType::VARCHAR);
+		names.push_back(sourceCol);
+		return_types.push_back(LogicalType::VARCHAR);
 		return std::move(data);
 	} catch (const std::exception &e) {
 		throw IOException(std::string("read_gor: ") + e.what());
@@ -1468,6 +1498,8 @@ void LoadInternal(ExtensionLoader &loader) {
 		tf.named_parameters["ff"] = tagList;
 		// GOR -p style hard range: range := 'chrN' | 'chrN:start-end'.
 		tf.named_parameters["range"] = duckdb::LogicalType::VARCHAR;
+		// GOR -s: rename the exposed source column (GORD only).
+		tf.named_parameters["source"] = duckdb::LogicalType::VARCHAR;
 		loader.RegisterFunction(tf);
 	};
 	registerGor("read_gor", duckdb::ReadGorBind);

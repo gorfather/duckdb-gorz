@@ -18,6 +18,7 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gorz {
@@ -37,6 +38,10 @@ struct GorMeta {
     // the same as no entry and falls back to the gor convention per column.
     std::optional<std::vector<std::optional<GorColumnType>>> schema;
     std::optional<int64_t> lineCount;
+    // Raw `## KEY = VALUE` header properties (e.g. SOURCE_COLUMN for a .gord's
+    // sidecar). Populated for every parsed key; SCHEMA / LINE_COUNT also keep
+    // their typed fields above.
+    std::unordered_map<std::string, std::string> properties;
 };
 
 // Parse a .meta file. Returns an empty GorMeta if the path doesn't exist or

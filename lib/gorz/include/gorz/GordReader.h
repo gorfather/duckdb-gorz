@@ -98,6 +98,11 @@ private:
         // Deleted tags for a selected bucket entry: rows whose source ∈ this set
         // are dropped even if requested (GOR's |D| stale-row handling).
         std::unordered_set<std::string> deletedTags;
+        // Source-column normalisation: a primary (single-tag) file has no source
+        // column, so append its tag as the trailing field; a bucket already
+        // carries it. Keeps every emitted row at the logical N+1 width.
+        bool appendSource = false;
+        std::string sourceValue;   // the tag to append (primary files only)
     };
 
     // Lazily apply bucket selection (for bucketized dictionaries), then the

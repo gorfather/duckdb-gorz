@@ -73,6 +73,7 @@ GorMeta parseMetaFile(const std::string& path, const Opener& opener) {
         if (eq == std::string::npos) continue;
         std::string key = trim(body.substr(0, eq));
         std::string value = trim(body.substr(eq + 1));
+        meta.properties[key] = value;
         if (key == "SCHEMA") {
             meta.schema = parseSchema(value);
         } else if (key == "LINE_COUNT") {

@@ -205,6 +205,12 @@ void GordReader::admit(const GordEntry& entry, std::size_t entryIdx) {
     it->entryIdx = entryIdx;
     it->rowFilter = entryNeedsRowFilter(entry);
     it->deletedTags = entry.deletedTags;
+    // A bucket already carries the source column; a primary needs its tag
+    // appended so both come out at the logical N+1 width (GOR insertSource).
+    it->appendSource = !entry.sourceInserted;
+    if (it->appendSource) {
+        it->sourceValue = entry.tags.empty() ? std::string() : entry.tags.front();
+    }
 
     // Intra-entry seek: jump to (rangeChrom_, rangePosLo_) inside this entry
     // — but only when the declared range starts strictly before that target,
@@ -248,6 +254,10 @@ void GordReader::admit(const GordEntry& entry, std::size_t entryIdx) {
             if (!tagFilter_.count(src) || it->deletedTags.count(src)) continue;
         }
         it->nextRow_.assign(rowView);
+        if (it->appendSource) {
+            it->nextRow_.push_back('\t');
+            it->nextRow_.append(it->sourceValue);
+        }
         it->nextChrom = std::move(chrom);
         it->nextPos = pos;
         // Push onto the heap. Heap is a min-heap, so we use a
@@ -291,6 +301,10 @@ void GordReader::advanceTop() {
             if (!tagFilter_.count(src) || it->deletedTags.count(src)) continue;  // non-requested / deleted
         }
         it->nextRow_.assign(rowView);
+        if (it->appendSource) {
+            it->nextRow_.push_back('\t');
+            it->nextRow_.append(it->sourceValue);
+        }
         it->nextChrom = std::move(chrom);
         it->nextPos = pos;
         heap_.push_back(std::move(it));

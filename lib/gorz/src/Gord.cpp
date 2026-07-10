@@ -129,20 +129,31 @@ Gord parseGordFile(const std::string& path, const Opener& opener) {
         rstripCR(line);
         if (line.empty()) continue;
         if (line[0] == '#') {
-            // ## COLUMNS = a,b,c... → split comma-separated names
             std::string key, value;
-            if (parseHeader(line, key, value) && key == "COLUMNS") {
-                g.columns.clear();
-                std::string cur;
-                for (char c : value) {
-                    if (c == ',') {
-                        if (!cur.empty()) g.columns.push_back(cur);
-                        cur.clear();
-                    } else {
-                        cur.push_back(c);
+            if (parseHeader(line, key, value)) {
+                // ## COLUMNS = a,b,c... → split comma-separated names
+                if (key == "COLUMNS") {
+                    g.columns.clear();
+                    std::string cur;
+                    for (char c : value) {
+                        if (c == ',') {
+                            if (!cur.empty()) g.columns.push_back(cur);
+                            cur.clear();
+                        } else {
+                            cur.push_back(c);
+                        }
                     }
+                    if (!cur.empty()) g.columns.push_back(cur);
+                } else if (key == "SOURCE_COLUMN" && !value.empty()) {
+                    // Explicit source-column name (mirrors GOR's meta property).
+                    g.sourceColumnName = value;
                 }
-                if (!cur.empty()) g.columns.push_back(cur);
+            } else if (line[1] != '#' && g.sourceColumnName.empty()) {
+                // Single-`#` header line: `#file\t<source>\t<col>...`. The 2nd
+                // field names the column the tag/source is stored under; use it
+                // as the source name unless a `## SOURCE_COLUMN` already set one.
+                auto hdr = splitTabs(line);
+                if (hdr.size() >= 2 && !hdr[1].empty()) g.sourceColumnName = hdr[1];
             }
             continue;
         }

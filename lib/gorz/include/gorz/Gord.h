@@ -49,11 +49,12 @@ struct GordEntry {
     // must be filtered out. A deleted line contributes its tag to the bucket's
     // deleted-tag set but is never read as an individual file.
     bool isDeleted = false;
-    // True when this entry is read AS A BUCKET: its rows carry a trailing
-    // `Source` column identifying each row's origin tag, so a per-row hash
-    // filter (GOR's POSSIBLE_TAG) applies and the source column is stripped to
-    // the logical schema. Set for a selected bucket entry, and for the legacy
-    // 7-col inline-tag-list form.
+    // True when this entry is read AS A BUCKET: its rows already carry a
+    // trailing `Source` column identifying each row's origin tag, so a per-row
+    // hash filter (GOR's POSSIBLE_TAG) applies. A primary (sourceInserted=false)
+    // has no such column, so GordReader appends its tag to match the bucket
+    // width (see GordReader OpenIterator::appendSource). Set for a selected
+    // bucket entry, and for the legacy 7-col inline-tag-list form.
     bool sourceInserted = false;
     // For a selected bucket entry: tags marked `|D|` for this bucket, so their
     // (stale) rows are dropped even if the caller's -f names them.
@@ -91,6 +92,12 @@ struct Gord {
     // but no -f/-ff was given.
     std::unordered_set<std::string> validTags;
     bool anyBucketHasDeletedFile = false;
+    // Source-column name carried by the dictionary itself: from a
+    // `## SOURCE_COLUMN = <name>` metadata line, else the 2nd column of a
+    // single-`#` header line (`#file\t<name>\t...`). Empty when neither is
+    // present. The final name resolves (in the driver) as:
+    //   explicit -s / source param  >  this  >  <dict>.meta SOURCE_COLUMN  >  "Source".
+    std::string sourceColumnName;
 };
 
 // Parse a flat GORD file. Accepts the GOR dictionary forms we support:
