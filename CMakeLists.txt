@@ -17,12 +17,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 # Building lib/gorz as C++17 (below) alongside DuckDB's C++11 core surfaces a
-# latent DuckDB ODR quirk on the Linux gcc-toolset-14 image: linking DuckDB's
-# own `plan_serializer` tool with this extension present reports a duplicate
+# latent DuckDB ODR quirk with GCC: linking DuckDB's own `plan_serializer` tool
+# with this extension present reports a duplicate
 # `duckdb::BufferedFileWriter::DEFAULT_OPEN_FLAGS` (a static constexpr — a
 # strong symbol under C++11). The two definitions are byte-identical, so let the
-# GNU linker keep the first. Linux/GNU-ld only (the affected platform).
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# GNU linker keep the first. Applies to every GNU toolchain that hit it — Linux
+# gcc-toolset-14 AND the Windows MinGW (x86_64-w64-mingw32) build; not MSVC,
+# AppleClang, or Emscripten, which link cleanly.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_EXE_LINKER_FLAGS
       "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-multiple-definition"
       CACHE STRING "" FORCE)
