@@ -64,12 +64,21 @@ public:
     // owned row buffer). Returns false at EOF.
     bool nextRow(std::string_view& outLine);
 
-    // The entries that survive the range + tag filters, sorted by declared
-    // (chromStart, posStart) — i.e. the set this reader would ever open. A
-    // caller can build a "planning" reader, set the filters, and read this to
-    // partition the surviving files across threads (Part 3), then hand each
-    // group to its own reader. Valid before the first nextRow().
-    const std::vector<GordEntry>& candidates() const { return candidates_; }
+    // The entries that survive bucket selection + range + tag filters, sorted
+    // by declared (chromStart, posStart) — i.e. the set this reader would ever
+    // open (for a bucketized dictionary this includes the synthetic bucket
+    // entries the heuristic chose). A caller can build a "planning" reader, set
+    // the filters, and read this to partition the surviving files across threads
+    // (Part 3), then hand each group to its own reader. Triggers finalisation;
+    // call after the filters are set and before the first nextRow().
+    const std::vector<GordEntry>& candidates();
+
+    // The *effective* requested tag set after finalisation: the explicit -f/-ff
+    // set, or the dictionary's validTags for a bucketized full scan (empty for
+    // an un-bucketized full scan). A caller that partitions candidates() across
+    // worker readers must pass this to each so their bucket row filter matches
+    // what the planner selected. Triggers finalisation.
+    std::vector<std::string> requestedTags();
 
 private:
     // One per opened entry. The Reader is constructed against the
@@ -86,7 +95,15 @@ private:
         std::size_t entryIdx = 0;  // stable tie-break across same (chrom, pos)
         bool exhausted = false;
         bool rowFilter = false;    // bucket entry → filter rows on source col
+        // Deleted tags for a selected bucket entry: rows whose source ∈ this set
+        // are dropped even if requested (GOR's |D| stale-row handling).
+        std::unordered_set<std::string> deletedTags;
     };
+
+    // Lazily apply bucket selection (for bucketized dictionaries), then the
+    // tag + range prunes, and sort the candidate list. Idempotent; runs once,
+    // triggered by candidates() or the first nextRow().
+    void finalize();
 
     // Open the entry, read its first in-range row into nextRow_, push
     // onto the heap. Drops the iterator (close + discard) if the entry
@@ -153,11 +170,16 @@ private:
     int64_t rangePosLo_ = 0;
     int64_t rangePosHi_ = 0;
 
-    // Tag filter (-f / -ff). When active, candidates are pruned by tag
-    // intersection and bucket rows are filtered on the source column.
-    bool tagFilterActive_ = false;
+    // Tag filter (-f / -ff). `pendingTags_` records the explicit request until
+    // finalize(); `tagFilter_` is the *effective* requested set used for both
+    // candidate pruning and the bucket row filter (the explicit tags, or the
+    // dictionary's validTags for a full scan of a bucketized dictionary).
+    bool tagFilterRequested_ = false;      // an explicit -f/-ff was given
+    std::vector<std::string> pendingTags_;
+    bool tagFilterActive_ = false;         // tagFilter_ is populated (post-finalize)
     std::unordered_set<std::string> tagFilter_;
 
+    bool finalized_ = false;
     bool firstCallDone_ = false;
 
     // The row returned by the most recent nextRow() call. We copy out of

@@ -897,6 +897,11 @@ unique_ptr<GlobalTableFunctionState> ReadGorInitGlobal(ClientContext &context, T
 		}
 		planner.setTagFilter(state->gordTags);
 		const auto &survivors = planner.candidates();
+		// Bucket selection may have replaced source files with synthetic bucket
+		// entries and (for a full scan of a bucketized dict) widened the tag set
+		// to validTags. Propagate the *effective* requested tags so each
+		// per-group reader's bucket row filter matches what the planner chose.
+		state->gordTags = planner.requestedTags();
 
 		if (!survivors.empty()) {
 			int32_t nThreads = TaskScheduler::GetScheduler(context).NumberOfThreads();

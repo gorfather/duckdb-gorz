@@ -31,8 +31,8 @@ std::string_view lastField(std::string_view row) {
 
 GordReader::GordReader(const Gord& gord, Opener opener)
     : gord_(gord), opener_(std::move(opener)) {
-    candidates_ = gord_.entries;
-    std::stable_sort(candidates_.begin(), candidates_.end(), CandidateLess{});
+    // Candidate list is built lazily in finalize() (after the filters are set),
+    // because bucket selection depends on the requested tag set.
 }
 
 GordReader::~GordReader() = default;
@@ -45,13 +45,60 @@ void GordReader::setRangeFilter(std::string chrom, int64_t posLo, int64_t posHi)
     rangeChrom_ = std::move(chrom);
     rangePosLo_ = posLo;
     rangePosHi_ = posHi;
-    // Prune candidates that provably don't overlap the range. Saves
-    // both file opens and the per-row in-range check on entries that
-    // are guaranteed to be empty.
-    candidates_.erase(
-        std::remove_if(candidates_.begin(), candidates_.end(),
-                       [&](const GordEntry& e) { return !entryOverlapsRange(e); }),
-        candidates_.end());
+    // Actual candidate pruning is deferred to finalize().
+}
+
+void GordReader::finalize() {
+    if (finalized_) return;
+    finalized_ = true;
+
+    // Effective requested tag set: the explicit -f/-ff request, or (for a full
+    // scan of a bucketized dictionary) all valid tags so the heuristic still
+    // opens buckets and deleted rows are dropped.
+    std::unordered_set<std::string> requested;
+    if (tagFilterRequested_) {
+        for (auto& t : pendingTags_) requested.insert(std::move(t));
+    } else if (!gord_.buckets.empty()) {
+        requested = gord_.validTags;
+    }
+
+    if (!gord_.buckets.empty()) {
+        // Bucketized: GOR's bucket-vs-primary selection replaces the entry list
+        // with the optimal mix of source files + synthetic bucket entries.
+        candidates_ = optimizedFileList(gord_, requested);
+        tagFilter_ = std::move(requested);   // drives the bucket row filter
+        tagFilterActive_ = true;
+    } else {
+        // Un-bucketized: keep the raw entries, tag-pruning on an explicit filter.
+        candidates_ = gord_.entries;
+        if (tagFilterRequested_) {
+            tagFilter_ = std::move(requested);
+            tagFilterActive_ = true;
+            candidates_.erase(
+                std::remove_if(candidates_.begin(), candidates_.end(),
+                               [&](const GordEntry& e) { return !entryTagsMatch(e); }),
+                candidates_.end());
+        }
+    }
+
+    // Range prune, then order by declared (chromStart, posStart) for admission.
+    if (rangeActive_) {
+        candidates_.erase(
+            std::remove_if(candidates_.begin(), candidates_.end(),
+                           [&](const GordEntry& e) { return !entryOverlapsRange(e); }),
+            candidates_.end());
+    }
+    std::stable_sort(candidates_.begin(), candidates_.end(), CandidateLess{});
+}
+
+const std::vector<GordEntry>& GordReader::candidates() {
+    finalize();
+    return candidates_;
+}
+
+std::vector<std::string> GordReader::requestedTags() {
+    finalize();
+    return std::vector<std::string>(tagFilter_.begin(), tagFilter_.end());
 }
 
 bool GordReader::entryOverlapsRange(const GordEntry& e) const {
@@ -98,16 +145,11 @@ void GordReader::setTagFilter(std::vector<std::string> tags) {
     if (firstCallDone_) {
         throw std::runtime_error("GordReader::setTagFilter called after nextRow()");
     }
-    if (tags.empty()) return;  // no filter requested
-    tagFilterActive_ = true;
-    tagFilter_.clear();
-    for (auto& t : tags) tagFilter_.insert(std::move(t));
-    // File-list pruning: drop entries whose tags don't intersect the filter —
-    // never opened. Composes with the range prune (each pass removes a subset).
-    candidates_.erase(
-        std::remove_if(candidates_.begin(), candidates_.end(),
-                       [&](const GordEntry& e) { return !entryTagsMatch(e); }),
-        candidates_.end());
+    if (tags.empty()) return;  // no explicit filter — full scan
+    tagFilterRequested_ = true;
+    pendingTags_ = std::move(tags);
+    // Bucket selection + candidate pruning are deferred to finalize(), which
+    // needs both the range and the tag request in hand.
 }
 
 bool GordReader::entryTagsMatch(const GordEntry& e) const {
@@ -123,7 +165,7 @@ bool GordReader::entryNeedsRowFilter(const GordEntry& e) const {
     // column) can hold rows for non-requested tags. If every one of the
     // bucket's tags is requested, all rows qualify (GOR's full match) → no row
     // filter; otherwise POSSIBLE_TAG → filter rows on the source column.
-    if (!tagFilterActive_ || !e.isBucket) return false;
+    if (!tagFilterActive_ || !e.sourceInserted) return false;
     for (const auto& t : e.tags) {
         if (!tagFilter_.count(t)) return true;  // a bucket tag not requested
     }
@@ -162,6 +204,7 @@ void GordReader::admit(const GordEntry& entry, std::size_t entryIdx) {
     }
     it->entryIdx = entryIdx;
     it->rowFilter = entryNeedsRowFilter(entry);
+    it->deletedTags = entry.deletedTags;
 
     // Intra-entry seek: jump to (rangeChrom_, rangePosLo_) inside this entry
     // — but only when the declared range starts strictly before that target,
@@ -197,11 +240,12 @@ void GordReader::admit(const GordEntry& entry, std::size_t entryIdx) {
                 break;
             }
         }
-        // Bucket row filter (GOR's POSSIBLE_TAG): drop rows whose source
-        // column (last field) isn't in the requested tag set. A single hash
+        // Bucket row filter (GOR's POSSIBLE_TAG): drop rows whose source column
+        // (last field) isn't requested, or belongs to a |D|-deleted tag. A hash
         // probe on the already-parsed row; only bucket entries pay for it.
-        if (it->rowFilter && !tagFilter_.count(std::string(lastField(rowView)))) {
-            continue;
+        if (it->rowFilter) {
+            std::string src(lastField(rowView));
+            if (!tagFilter_.count(src) || it->deletedTags.count(src)) continue;
         }
         it->nextRow_.assign(rowView);
         it->nextChrom = std::move(chrom);
@@ -242,8 +286,9 @@ void GordReader::advanceTop() {
             if (pos < rangePosLo_) continue;
             if (pos > rangePosHi_) { it.reset(); return; }  // close + drop
         }
-        if (it->rowFilter && !tagFilter_.count(std::string(lastField(rowView)))) {
-            continue;  // bucket row for a non-requested tag
+        if (it->rowFilter) {
+            std::string src(lastField(rowView));
+            if (!tagFilter_.count(src) || it->deletedTags.count(src)) continue;  // non-requested / deleted
         }
         it->nextRow_.assign(rowView);
         it->nextChrom = std::move(chrom);
@@ -261,6 +306,7 @@ void GordReader::advanceTop() {
 }
 
 bool GordReader::nextRow(std::string_view& outLine) {
+    finalize();
     firstCallDone_ = true;
 
     while (true) {
