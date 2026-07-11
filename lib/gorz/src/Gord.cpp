@@ -31,6 +31,40 @@ void rstripCR(std::string& s) {
     while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) s.pop_back();
 }
 
+// Split a single-`#` dictionary header line into column names. Mirrors GOR's
+// TableHeader.parseHeaderLine: strip leading '#'/whitespace, then split on
+// tab OR comma (a header may be comma-delimited). Used only to name the
+// source column, so the exact GOR splitter matters for parity.
+std::vector<std::string> splitHeaderCols(const std::string& line) {
+    std::size_t start = 0;
+    while (start < line.size() &&
+           (line[start] == '#' || line[start] == ' ' || line[start] == '\t')) {
+        ++start;
+    }
+    std::vector<std::string> out;
+    std::size_t fieldStart = start;
+    for (std::size_t i = start; i <= line.size(); ++i) {
+        if (i == line.size() || line[i] == '\t' || line[i] == ',') {
+            out.emplace_back(line.substr(fieldStart, i - fieldStart));
+            fieldStart = i + 1;
+        }
+    }
+    return out;
+}
+
+// ASCII case-insensitive equality (GOR compares the dummy "col2" header
+// placeholder case-insensitively).
+bool iequalsAscii(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
 // Resolve a path against `dictParent` if relative; pass through if absolute.
 std::string resolvePath(const std::string& raw, const std::string& dictParent) {
     namespace fs = std::filesystem;
@@ -149,11 +183,16 @@ Gord parseGordFile(const std::string& path, const Opener& opener) {
                     g.sourceColumnName = value;
                 }
             } else if (line[1] != '#' && g.sourceColumnName.empty()) {
-                // Single-`#` header line: `#file\t<source>\t<col>...`. The 2nd
-                // field names the column the tag/source is stored under; use it
-                // as the source name unless a `## SOURCE_COLUMN` already set one.
-                auto hdr = splitTabs(line);
-                if (hdr.size() >= 2 && !hdr[1].empty()) g.sourceColumnName = hdr[1];
+                // Single-`#` header line names the columns (File, Source, [Tags]).
+                // GOR takes the source-column name from the 2nd column, splitting
+                // on tab OR comma, and only when it's a *proper* header — at least
+                // 2 columns and the 2nd not the dummy placeholder "col2"
+                // (TableHeader.isProperTableHeader). Otherwise the name stays the
+                // default "Source". Set unless a `## SOURCE_COLUMN` already did.
+                auto hdr = splitHeaderCols(line);
+                if (hdr.size() >= 2 && !hdr[1].empty() && !iequalsAscii(hdr[1], "col2")) {
+                    g.sourceColumnName = hdr[1];
+                }
             }
             continue;
         }

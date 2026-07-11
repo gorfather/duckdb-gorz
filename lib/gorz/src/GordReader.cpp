@@ -209,6 +209,17 @@ void GordReader::admit(const GordEntry& entry, std::size_t entryIdx) {
     // appended so both come out at the logical N+1 width (GOR insertSource).
     it->appendSource = !entry.sourceInserted;
     if (it->appendSource) {
+        // GAP vs Java (intentional): Java inserts getAlias() — dictionary
+        // column 2 — as the source value, while -f/-ff selection for a
+        // bucketized (7-col) line matches getFilterTags() — column 7. We
+        // instead append tags.front() (the column-7 filter tag when present,
+        // else the alias). This only differs for a malformed 7-col line with a
+        // single tag where column 2 != column 7; for every well-formed dict
+        // the two agree (a single-tag file's alias IS its tag). Where they do
+        // differ, appending the column-7 value keeps the emitted Source
+        // consistent with what was filtered on — arguably better than Java.
+        // The proper fix (make Java use column 7, or forbid the mismatch)
+        // belongs upstream in the gorpipe / gormore Java driver, not here.
         it->sourceValue = entry.tags.empty() ? std::string() : entry.tags.front();
     }
 
