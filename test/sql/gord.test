@@ -86,6 +86,23 @@ SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1']);
 ----
 2
 
+# ff is a tag FILE (first tab-delimited column, '#' lines skipped) — GOR's file
+# filter — equivalent to the inline -f list. Header + extra column are ignored.
+statement ok
+COPY (SELECT * FROM (VALUES ('#PN','hdr'),('s1','x'),('s2','y')) t(tag,extra))
+  TO '__TEST_DIR__/tags.tsv' (FORMAT csv, DELIMITER E'\t', HEADER false, QUOTE '');
+
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', ff := '__TEST_DIR__/tags.tsv');
+----
+4
+
+# f (inline list) and ff (file) union together.
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1'], ff := '__TEST_DIR__/tags.tsv');
+----
+4
+
 # Naming the deleted tag alongside live ones still drops its stale bucket rows.
 query I
 SELECT count(*) FROM read_gord('__TEST_DIR__/d.gord', f := ['s1','s2','s3']);

@@ -662,10 +662,10 @@ void seekHintComplexPushdown(ClientContext &, LogicalGet &get, FunctionData *bin
 	}
 }
 
-// Collect a named tag parameter (f / ff) into `out`. Accepts a LIST(VARCHAR)
-// — a literal `['a','b']`, a subquery `(SELECT list(x) ...)`, or any expression
-// producing a list — and, for convenience, a bare VARCHAR. GOR keeps both -f
-// (list) and -ff (file/expression); here both are lists, unioned by the caller.
+// GOR -f: collect the inline tag list into `out`. Accepts a LIST(VARCHAR) — a
+// literal `['a','b']` or a materialised query result — and, for convenience, a
+// bare VARCHAR. (DuckDB table functions can't take a subquery argument directly;
+// evaluate the SELECT first and pass the resulting list.)
 void collectTagParam(TableFunctionBindInput &input, const char *name, std::vector<std::string> &out) {
 	auto it = input.named_parameters.find(name);
 	if (it == input.named_parameters.end() || it->second.IsNull())
@@ -678,6 +678,39 @@ void collectTagParam(TableFunctionBindInput &input, const char *name, std::vecto
 		}
 	} else {
 		out.push_back(v.ToString());
+	}
+}
+
+// GOR -ff: a *path* to a tag file (distinct from -f's inline list — "file
+// filter"). Reads one tag per line — the first tab-delimited field, `#` lines
+// skipped, each trimmed — mirroring GOR's readTagsFromFile. Routed through the
+// DuckDB FileSystem opener so the tag file can live in an object store too.
+// (GORpipe's -ff also accepts a nested query; DuckDB table functions can't, so
+// here it is strictly a file path.)
+void collectTagFile(TableFunctionBindInput &input, const char *name, const gorz::Opener &opener,
+                    std::vector<std::string> &out) {
+	auto it = input.named_parameters.find(name);
+	if (it == input.named_parameters.end() || it->second.IsNull())
+		return;
+	std::string tagPath = it->second.ToString();
+	if (tagPath.empty())
+		return;
+	auto in = opener(tagPath);
+	if (!in)
+		throw IOException("read_gor: ff tag file not found: " + tagPath);
+	std::string line;
+	while (std::getline(*in, line)) {
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (line.empty() || line[0] == '#')
+			continue;
+		std::size_t tab = line.find('\t');
+		std::string tag = (tab == std::string::npos) ? line : line.substr(0, tab);
+		std::size_t b = tag.find_first_not_of(" \t");
+		std::size_t e = tag.find_last_not_of(" \t");
+		if (b == std::string::npos)
+			continue; // blank after trim
+		out.push_back(tag.substr(b, e - b + 1));
 	}
 }
 
@@ -783,8 +816,8 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 	data->path = path;
 
 	// GOR -f / -ff partition filter (union of both). Only valid for .gord.
-	collectTagParam(input, "f", data->tagFilter);
-	collectTagParam(input, "ff", data->tagFilter);
+	collectTagParam(input, "f", data->tagFilter);          // -f  : inline list
+	collectTagFile(input, "ff", fsOpener, data->tagFilter); // -ff : tag file
 
 	// GOR -s: rename the exposed source column. Only meaningful for .gord.
 	auto srcIt = input.named_parameters.find("source");
@@ -1490,12 +1523,13 @@ void LoadInternal(ExtensionLoader &loader) {
 		                         duckdb::ReadGorInitGlobal, duckdb::ReadGorInitLocal);
 		tf.pushdown_complex_filter = duckdb::seekHintComplexPushdown<duckdb::GorBindData>;
 		tf.projection_pushdown = true;
-		// GOR -f / -ff partition filtering (GORD only; validated at bind). Both
-		// are LIST(VARCHAR) so a literal list, a subquery, or an expression all
-		// work; the two are unioned.
-		auto tagList = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
-		tf.named_parameters["f"] = tagList;
-		tf.named_parameters["ff"] = tagList;
+		// GOR partition filtering (GORD only; validated at bind), unioned:
+		//   f  : an inline LIST(VARCHAR) of tags — a literal or a materialised
+		//        query result (DuckDB can't take a subquery arg directly).
+		//   ff : a VARCHAR *path* to a tag file (one tag per line / first
+		//        tab-delimited column, '#' lines skipped) — GOR's "file filter".
+		tf.named_parameters["f"] = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+		tf.named_parameters["ff"] = duckdb::LogicalType::VARCHAR;
 		// GOR -p style hard range: range := 'chrN' | 'chrN:start-end'.
 		tf.named_parameters["range"] = duckdb::LogicalType::VARCHAR;
 		// GOR -s: rename the exposed source column (GORD only).
