@@ -33,6 +33,21 @@ COPY (SELECT chrom, pos, ref, alt FROM my_variants ORDER BY chrom, pos)
 
 Files written by this extension are read/seeked natively by `gorpipe` itself, and vice-versa.
 
+## Demo notebook
+
+[`examples/gorz_community_extension.ipynb`](examples/gorz_community_extension.ipynb)
+walks through the published extension end to end — `.gorz` round-trip, range
+pushdown (GOR's `-p` semantics), `.gord` dictionaries and the `Source` column,
+and partition filtering with `f` / `ff` tag files.
+
+It installs the extension from the community repository, so it needs no local
+build and writes only to `/tmp`:
+
+```shell
+pip install duckdb jupyterlab pandas
+jupyter lab examples/gorz_community_extension.ipynb
+```
+
 ## Building locally
 
 Uses the standard DuckDB extension toolchain (vcpkg for the `zlib` + `zstd` deps):
