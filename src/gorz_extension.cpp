@@ -1004,6 +1004,15 @@ unique_ptr<GlobalTableFunctionState> ReadGorInitGlobal(ClientContext &context, T
 		int32_t nThreads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 		idx_t g = std::min<idx_t>(std::max<idx_t>(1, static_cast<idx_t>(nThreads)),
 		                          std::max<idx_t>(1, static_cast<idx_t>(span / MIN_CHUNK)));
+		// gorz_scan_chunk_bytes > 0 overrides the plan with fixed-size ranges
+		// (independent of the thread count). Tests set it to 1 so every block
+		// start is also a range start — see test/sql/gorz_parallel_split.test.
+		Value chunkSetting;
+		if (context.TryGetCurrentSetting("gorz_scan_chunk_bytes", chunkSetting) && !chunkSetting.IsNull()) {
+			int64_t fixedChunk = chunkSetting.GetValue<int64_t>();
+			if (fixedChunk > 0 && span > 0)
+				g = static_cast<idx_t>((span + fixedChunk - 1) / fixedChunk);
+		}
 		if (g > 1) {
 			state->gorzParallel = true;
 			int64_t chunk = span / static_cast<int64_t>(g); // byte-balanced
@@ -1565,6 +1574,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = duckdb::DBConfig::GetConfig(db);
 	config.replacement_scans.emplace_back(duckdb::GorzReplacementScan);
+	config.AddExtensionOption("gorz_scan_chunk_bytes",
+	                          "Byte size of each parallel .gorz full-scan range (0 = automatic: one range per "
+	                          "thread, at least 16 MiB each)",
+	                          duckdb::LogicalType::BIGINT, duckdb::Value::BIGINT(0));
 
 	loader.SetDescription("Read/write GORpipe .gorz files and .gord dictionaries as native DuckDB "
 	                      "tables (read_gor / read_gorz / read_gord + COPY TO). "

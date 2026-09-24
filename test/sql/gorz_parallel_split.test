@@ -1,0 +1,69 @@
+# name: test/sql/gorz_parallel_split.test
+# description: parallel .gorz full scan must not drop a block when a byte-range split lands exactly on a block start
+# group: [sql]
+
+require gorz
+
+# Regression: a byte range whose start offset was exactly the first byte of a
+# block skipped that whole block (it discarded "the partial block owned by the
+# previous range" up to the next '\n'), while the previous range stopped before
+# it — so the block was read by nobody. With real files this only happens when
+# a split point hits a block start by chance (see docs/parallel-split-bug.md),
+# so here we force it: gorz_scan_chunk_bytes = 1 makes EVERY byte a range
+# start, hence every block start is a range start.
+
+# ~50 row-oriented blocks, ~50 KB (the writer flushes at ~32 KiB uncompressed).
+statement ok
+COPY (SELECT 'chr' || (i // 2500 + 1) AS chrom, i % 2500 + 1 AS pos, repeat('ACGT', 50) || i AS seq
+      FROM range(7500) t(i) ORDER BY chrom, pos)
+  TO '__TEST_DIR__/split.gorz' (FORMAT gorz);
+
+# Reference: single-threaded read.
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE ref AS SELECT * FROM read_gorz('__TEST_DIR__/split.gorz');
+
+query I
+SELECT count(*) FROM ref;
+----
+7500
+
+# Every byte a range start → every block boundary exercised.
+statement ok
+SET threads = 4;
+
+statement ok
+SET gorz_scan_chunk_bytes = 1;
+
+query I
+SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+----
+7500
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_gorz('__TEST_DIR__/split.gorz') EXCEPT ALL SELECT * FROM ref)
+  UNION ALL
+  (SELECT * FROM ref EXCEPT ALL SELECT * FROM read_gorz('__TEST_DIR__/split.gorz')));
+----
+0
+
+# An odd, non-aligned chunk size (most splits land mid-block).
+statement ok
+SET gorz_scan_chunk_bytes = 997;
+
+query I
+SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+----
+7500
+
+# Back to the automatic plan (file is below the 16 MiB split threshold → one range).
+statement ok
+RESET gorz_scan_chunk_bytes;
+
+query I
+SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+----
+7500
