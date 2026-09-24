@@ -341,8 +341,12 @@ bool Reader::readNextBlock() {
             } else {
                 // Skip the partial block owned by the previous partition:
                 // consume up to (and past) its terminating '\n'. The next byte
-                // is our first block's start.
-                in_.seekg(static_cast<std::streamoff>(byteRangeStart_));
+                // is our first block's start. Start the scan one byte early so
+                // that when byteRangeStart_ is itself a block start (the byte
+                // before it is the previous block's '\n') we consume just that
+                // '\n' and keep the block — the previous partition stops at
+                // tellg() >= end and won't read it either.
+                in_.seekg(static_cast<std::streamoff>(byteRangeStart_ - 1));
                 std::vector<uint8_t> discard;
                 if (!readUntil(in_, '\n', discard)) return false;  // no boundary before EOF
             }
