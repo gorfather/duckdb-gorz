@@ -25,6 +25,7 @@ COPY (SELECT chrom, pos, ref, alt FROM my_variants ORDER BY chrom, pos)
 - **`read_gor(path)`** — auto-detects `.gorz` vs `.gord` by extension.
 - **`read_gorz(path)` / `read_gord(path)`** — force the kind.
 - **Replacement scan** — `FROM 'x.gorz'` / `FROM 'x.gord'` works with no function call.
+- **`pgor … | write x.gord` folders** — pass the folder itself (`FROM 'x.gord'`); it reads the `x.gord/thedict.gord` inside, so the explicit `'x.gord/thedict.gord'` is optional.
 - **Projection & parallel scan** — only selected columns are read; large files scan across threads.
 - **`WHERE chrom/pos` → block seek** — range predicates seek into the right block instead of scanning the whole file.
 - **Partition filters** — GOR's `-f` / `-ff` semantics prune a `.gord`'s file list and expose a `Source` column: `f := ['A','B']` is an inline tag list, `ff := 'tags.txt'` is a *tag file* (one tag per line / first tab-delimited column, `#` lines skipped). `source := 'PN'` renames the exposed column.
