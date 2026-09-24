@@ -840,7 +840,7 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 	data->path = path;
 
 	// GOR -f / -ff partition filter (union of both). Only valid for .gord.
-	collectTagParam(input, "f", data->tagFilter);          // -f  : inline list
+	collectTagParam(input, "f", data->tagFilter);           // -f  : inline list
 	collectTagFile(input, "ff", fsOpener, data->tagFilter); // -ff : tag file
 
 	// GOR -s: rename the exposed source column. Only meaningful for .gord.
