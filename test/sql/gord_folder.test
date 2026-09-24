@@ -1,0 +1,73 @@
+# name: test/sql/gord_folder.test
+# description: a `pgor ... | write name.gord` folder can be read by its folder path (name.gord → name.gord/thedict.gord)
+# group: [sql]
+
+require gorz
+
+# pgor's write produces a FOLDER name.gord/ holding the partition .gorz files
+# and the dictionary name.gord/thedict.gord (entries relative to the folder),
+# e.g. for: create temp = gorrow chr1,1 | merge <(gorrow chr2,2); pgor [temp] | write t.gord
+#
+# Rebuild that layout with COPY. A PARTITION_BY copy is the only way to create
+# a directory from SQL, so use one to make t.gord/ (it leaves a harmless k=1/
+# subfolder the dictionary never references).
+statement ok
+COPY (SELECT 1 AS k, 0 AS x) TO '__TEST_DIR__/t.gord' (FORMAT csv, PARTITION_BY k);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1', 1)) t(chrom, pos)) TO '__TEST_DIR__/t.gord/p1.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('chr2', 2)) t(chrom, pos)) TO '__TEST_DIR__/t.gord/p2.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('p1.gorz', '1', 'chr1', 1, 'chr1', 1),
+    ('p2.gorz', '2', 'chr2', 2, 'chr2', 2)) t(f, tag, cs, ps, ce, pe))
+  TO '__TEST_DIR__/t.gord/thedict.gord' (FORMAT csv, DELIMITER E'\t', HEADER false);
+
+# The explicit dictionary path (what one had to write before).
+query TIT
+SELECT * FROM '__TEST_DIR__/t.gord/thedict.gord' ORDER BY chrom;
+----
+chr1	1	1
+chr2	2	2
+
+# The folder path — replacement scan, read_gor, read_gord, and a trailing '/'.
+query TIT
+SELECT * FROM '__TEST_DIR__/t.gord' ORDER BY chrom;
+----
+chr1	1	1
+chr2	2	2
+
+query I
+SELECT count(*) FROM read_gor('__TEST_DIR__/t.gord');
+----
+2
+
+query I
+SELECT count(*) FROM read_gord('__TEST_DIR__/t.gord');
+----
+2
+
+query I
+SELECT count(*) FROM '__TEST_DIR__/t.gord/';
+----
+2
+
+# Folder path composes with the partition filter and range.
+query TI
+SELECT chrom, pos FROM read_gord('__TEST_DIR__/t.gord', f := ['2']);
+----
+chr2	2
+
+query TI
+SELECT chrom, pos FROM read_gor('__TEST_DIR__/t.gord', range := 'chr1');
+----
+chr1	1
+
+# read_gorz forces the GORZ kind, so a .gord folder is not rewritten there.
+statement error
+SELECT * FROM read_gorz('__TEST_DIR__/t.gord');
+----
+read_gor

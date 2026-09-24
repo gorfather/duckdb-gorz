@@ -241,6 +241,28 @@ std::string resolvePathViaFileSearch(ClientContext &context, const std::string &
 	return p; // no match — let the downstream open fail with a clean error
 }
 
+// A `pgor ... | write name.gord` result is a FOLDER named name.gord holding the
+// partition .gorz files plus the dictionary itself as name.gord/thedict.gord
+// (GORpipe's DictionaryFolder convention). Accept the folder path too: when a
+// .gord path is a directory (or, on stores without real directories, isn't a
+// file but has a thedict.gord under it), read its thedict.gord. Trailing '/'s
+// are dropped first so 'name.gord/' works as well.
+std::string resolveGordFolder(ClientContext &context, std::string p) {
+	while (p.size() > 1 && p.back() == '/')
+		p.pop_back();
+	if (!StringUtil::EndsWith(StringUtil::Lower(p), ".gord"))
+		return p;
+	auto &fs = FileSystem::GetFileSystem(context);
+	std::string inner = fs.JoinPath(p, "thedict.gord");
+	try {
+		if (fs.DirectoryExists(p) || (!fs.FileExists(p) && fs.FileExists(inner)))
+			return inner;
+	} catch (...) {
+		// Probing unsupported for this path — leave it to the normal open.
+	}
+	return p;
+}
+
 // ---- DuckDB FileSystem-backed input stream --------------------------------
 //
 // gorz::Reader consumes a *seekable* std::istream. To let read_gorz read from
@@ -807,6 +829,8 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 		throw BinderException("read_gor expects a single VARCHAR file path");
 	}
 	auto path = resolvePathViaFileSearch(context, input.inputs[0].GetValue<std::string>());
+	if (!forced.has_value() || *forced == GorKind::GORD)
+		path = resolveGordFolder(context, path); // name.gord/ → name.gord/thedict.gord
 	GorKind kind = forced.has_value()
 	                   ? *forced
 	                   : (StringUtil::EndsWith(StringUtil::Lower(path), ".gord") ? GorKind::GORD : GorKind::GORZ);
@@ -1285,6 +1309,8 @@ unique_ptr<TableRef> GorzReplacementScan(ClientContext &, ReplacementScanInput &
                                          optional_ptr<ReplacementScanData>) {
 	auto full = ReplacementScan::GetFullPath(input);
 	auto lower = StringUtil::Lower(full);
+	while (lower.size() > 1 && lower.back() == '/') // 'name.gord/' (a pgor write folder)
+		lower.pop_back();
 	// SELECT * FROM 'foo.gorz' / 'foo.gord' → read_gor('...'), which dispatches
 	// on the extension internally.
 	if (!StringUtil::EndsWith(lower, ".gorz") && !StringUtil::EndsWith(lower, ".gord")) {
