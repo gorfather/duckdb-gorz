@@ -11,6 +11,8 @@
 //   * a replacement scan rewriting 'foo.gorz' / 'foo.gord' literals to
 //     read_gor(...), like DuckDB's .csv / .parquet auto-detect.
 //   * COPY TO (FORMAT gorz | gor) write functions.
+//   * COPY TO (FORMAT gord): a dictionary folder (x.gord/ + thedict.gord),
+//     partitioned by genomic range and sorted per file.
 
 // DuckDB header forward-declares BoundFunctionExpression in several
 // places and then uses unique_ptr<BoundFunctionExpression> in inline
@@ -41,6 +43,19 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/common/crypto/md5.hpp"
+#include "duckdb/common/hive_partitioning.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_copy_to_file.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include "gorz/Gord.h"
 #include "gorz/GordReader.h"
@@ -51,15 +66,20 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <istream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ostream>
 #include <streambuf>
 #include <string>
+#include <thread>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -365,13 +385,18 @@ private:
 // and — later — object stores). Sequential append only; no seeking.
 class FileHandleOutStreamBuf : public std::streambuf {
 public:
-	explicit FileHandleOutStreamBuf(unique_ptr<FileHandle> handle) : handle_(std::move(handle)) {
+	// `md5` (optional, not owned) accumulates a digest of every byte written —
+	// the .meta sidecar's MD5 is over the file's on-disk bytes, as in GOR.
+	explicit FileHandleOutStreamBuf(unique_ptr<FileHandle> handle, MD5Context *md5 = nullptr)
+	    : handle_(std::move(handle)), md5_(md5) {
 	}
 
 protected:
 	std::streamsize xsputn(const char *s, std::streamsize n) override {
 		if (n > 0) {
 			handle_->Write(const_cast<char *>(s), static_cast<idx_t>(n));
+			if (md5_)
+				md5_->Add(const_data_ptr_cast(s), static_cast<idx_t>(n));
 		}
 		return n;
 	}
@@ -379,19 +404,23 @@ protected:
 		if (ch != traits_type::eof()) {
 			char c = static_cast<char>(ch);
 			handle_->Write(&c, 1);
+			if (md5_)
+				md5_->Add(const_data_ptr_cast(&c), 1);
 		}
 		return ch;
 	}
 
 private:
 	unique_ptr<FileHandle> handle_;
+	MD5Context *md5_;
 };
 
 // Owns the streambuf and presents it as an ostream (buf initialised before we
 // point rdbuf at it, so it outlives the ostream base).
 class FileHandleOutputStream : public std::ostream {
 public:
-	explicit FileHandleOutputStream(unique_ptr<FileHandle> handle) : std::ostream(nullptr), buf_(std::move(handle)) {
+	explicit FileHandleOutputStream(unique_ptr<FileHandle> handle, MD5Context *md5 = nullptr)
+	    : std::ostream(nullptr), buf_(std::move(handle), md5) {
 		rdbuf(&buf_);
 	}
 
@@ -1353,9 +1382,14 @@ unique_ptr<TableRef> GorzReplacementScan(ClientContext &, ReplacementScanInput &
 // text (NULL -> empty field). Rows must already be in GOR order — the sink
 // VALIDATES (lexicographic chrom, non-decreasing pos within a chrom) and errors
 // out otherwise, mirroring GorZipLexOutputStream. Nothing re-sorts; ORDER BY in
-// the query is the caller's job. No .meta / .gori sidecars, no columnar/zstd,
-// no parallelism (execution_mode is pinned to REGULAR so insertion order — and
+// the query is the caller's job. No .gori sidecar, no columnar/zstd, no
+// parallelism (execution_mode is pinned to REGULAR so insertion order — and
 // therefore the validation — holds).
+//
+// FORMAT gorz takes one option, META: also write GOR's `<file>.meta` sidecar
+// (COLUMNS, SCHEMA, LINE_COUNT, RANGE, MD5). read_gor takes the column types
+// back from its SCHEMA, and a .gord dictionary is assembled from these sidecars
+// (see FORMAT gord below).
 // ===========================================================================
 
 enum class GorWriteFormat { GORZ, GOR };
@@ -1364,17 +1398,19 @@ struct GorCopyBindData : public FunctionData {
 	GorWriteFormat format = GorWriteFormat::GORZ;
 	vector<string> names; // SELECT output column names -> header
 	vector<LogicalType> sqlTypes;
+	bool writeMeta = false; // META option (GORZ only)
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<GorCopyBindData>();
 		r->format = format;
 		r->names = names;
 		r->sqlTypes = sqlTypes;
+		r->writeMeta = writeMeta;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<GorCopyBindData>();
-		return format == o.format && names == o.names && sqlTypes == o.sqlTypes;
+		return format == o.format && names == o.names && sqlTypes == o.sqlTypes && writeMeta == o.writeMeta;
 	}
 };
 
@@ -1382,8 +1418,12 @@ struct GorCopyBindData : public FunctionData {
 // global state); the mutex is belt-and-suspenders in case DuckDB ever hands the
 // sink to more than one thread.
 struct GorCopyGlobalState : public GlobalFunctionData {
+	std::string path;
+	MD5Context md5;                      // of the bytes written; only fed when META is on
 	unique_ptr<std::ostream> out;        // owns the FileHandle stream
 	unique_ptr<gorz::Writer> gorzWriter; // GORZ only; null for plain GOR
+	std::string firstChrom;
+	int64_t firstPos = 0;
 	std::string lastChrom;
 	int64_t lastPos = 0;
 	bool haveLast = false;
@@ -1393,7 +1433,42 @@ struct GorCopyGlobalState : public GlobalFunctionData {
 
 struct GorCopyLocalState : public LocalFunctionData {};
 
-unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &, const vector<string> &names,
+// A COPY option given bare (`META`) or with a value (`META true`).
+bool copyBoolOption(const vector<Value> &values) {
+	return values.empty() || values[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+}
+
+// The .meta SCHEMA letter for a SQL type — the inverse of resolveColumnType.
+// Anything GOR has no letter for is written (and read back) as a string.
+char gorSchemaLetter(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+		return 'I';
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UINTEGER:
+		return 'L';
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		return 'D';
+	default:
+		return 'S';
+	}
+}
+
+// Create/overwrite `path` with `text` through DuckDB's FileSystem.
+void writeTextFile(FileSystem &fs, const std::string &path, const std::string &text) {
+	auto handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
+	handle->Truncate(0);
+	handle->Write(const_cast<char *>(text.data()), static_cast<idx_t>(text.size()));
+	handle->Close();
+}
+
+unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
                                      const vector<LogicalType> &sqlTypes, GorWriteFormat fmt) {
 	const char *fmtName = (fmt == GorWriteFormat::GORZ) ? "gorz" : "gor";
 	if (names.size() < 2) {
@@ -1412,6 +1487,14 @@ unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &, c
 	bd->format = fmt;
 	bd->names = names;
 	bd->sqlTypes = sqlTypes;
+	for (auto &opt : input.info.options) {
+		if (StringUtil::CIEquals(opt.first, "meta")) {
+			if (fmt != GorWriteFormat::GORZ) {
+				throw BinderException("COPY ... TO (FORMAT gor): META is only supported for FORMAT gorz");
+			}
+			bd->writeMeta = copyBoolOption(opt.second);
+		}
+	}
 	return std::move(bd);
 }
 
@@ -1440,7 +1523,8 @@ unique_ptr<GlobalFunctionData> GorCopyInitGlobal(ClientContext &context, Functio
 	handle->Truncate(0); // overwrite semantics — no trailing bytes from a prior file
 
 	auto gs = make_uniq<GorCopyGlobalState>();
-	gs->out = make_uniq<FileHandleOutputStream>(std::move(handle));
+	gs->path = file_path;
+	gs->out = make_uniq<FileHandleOutputStream>(std::move(handle), bd.writeMeta ? &gs->md5 : nullptr);
 	if (bd.format == GorWriteFormat::GORZ) {
 		// Writer emits the header (verbatim column names) in its constructor.
 		gs->gorzWriter = make_uniq<gorz::Writer>(*gs->out, bd.names);
@@ -1460,41 +1544,61 @@ unique_ptr<LocalFunctionData> GorCopyInitLocal(ExecutionContext &, FunctionData 
 	return make_uniq<GorCopyLocalState>();
 }
 
-void GorCopySink(ExecutionContext &, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
+void GorCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
                  DataChunk &input) {
 	auto &bd = bind_data.Cast<GorCopyBindData>();
 	auto &gs = gstate.Cast<GorCopyGlobalState>();
 	const idx_t ncol = input.ColumnCount();
 	const idx_t nrow = input.size();
-	input.Flatten(); // simplify per-cell GetValue
+	if (nrow == 0) {
+		return;
+	}
+
+	// Cast a whole column at a time rather than boxing every cell: pos → BIGINT,
+	// every other non-VARCHAR column → VARCHAR (the same text Value::ToString gives).
+	vector<unique_ptr<Vector>> casts;
+	vector<UnifiedVectorFormat> cols(ncol);
+	for (idx_t c = 0; c < ncol; ++c) {
+		const LogicalType target = (c == 1) ? LogicalType::BIGINT : LogicalType::VARCHAR;
+		if (input.data[c].GetType() == target) {
+			input.data[c].ToUnifiedFormat(nrow, cols[c]);
+			continue;
+		}
+		casts.push_back(make_uniq<Vector>(target));
+		VectorOperations::Cast(context.client, input.data[c], *casts.back(), nrow);
+		casts.back()->ToUnifiedFormat(nrow, cols[c]);
+	}
+	const auto chromData = UnifiedVectorFormat::GetData<string_t>(cols[0]);
+	const auto posData = UnifiedVectorFormat::GetData<int64_t>(cols[1]);
 
 	std::lock_guard<std::mutex> lock(gs.mtx);
 	std::string rest;
 	for (idx_t r = 0; r < nrow; ++r) {
-		Value cval = input.GetValue(0, r);
-		if (cval.IsNull()) {
+		const idx_t ci = cols[0].sel->get_index(r);
+		if (!cols[0].validity.RowIsValid(ci)) {
 			throw InvalidInputException("gor COPY: chrom (column 1) must not be NULL");
 		}
-		std::string chrom = cval.ToString();
-		Value pval = input.GetValue(1, r);
-		if (pval.IsNull()) {
+		const std::string_view chrom(chromData[ci].GetData(), chromData[ci].GetSize());
+		const idx_t pi = cols[1].sel->get_index(r);
+		if (!cols[1].validity.RowIsValid(pi)) {
 			throw InvalidInputException("gor COPY: pos (column 2) must not be NULL");
 		}
-		int64_t pos = pval.GetValue<int64_t>();
+		const int64_t pos = posData[pi];
 
 		// GOR order rule (matches GorZipLexOutputStream): chromosomes ascend
 		// lexicographically (chr1 < chr10 < ... < chr2), positions are
 		// non-decreasing within a chromosome. std::string '<' == Java
 		// String.compareTo for the ASCII chrom names in practice.
+		const bool sameChrom = gs.haveLast && chrom == gs.lastChrom;
 		if (gs.haveLast) {
-			if (chrom == gs.lastChrom) {
+			if (sameChrom) {
 				if (pos < gs.lastPos) {
 					throw InvalidInputException("Wrong order in gor stream " + std::to_string(pos) + " " +
 					                            std::to_string(gs.lastPos) + " (need ORDER BY chrom, pos)");
 				}
-			} else if (chrom < gs.lastChrom) {
-				throw InvalidInputException("Wrong chromosome order in gor stream " + chrom + " " + gs.lastChrom +
-				                            " (need ORDER BY chrom, pos)");
+			} else if (chrom < std::string_view(gs.lastChrom)) {
+				throw InvalidInputException("Wrong chromosome order in gor stream " + std::string(chrom) + " " +
+				                            gs.lastChrom + " (need ORDER BY chrom, pos)");
 			}
 		}
 
@@ -1502,9 +1606,11 @@ void GorCopySink(ExecutionContext &, FunctionData &bind_data, GlobalFunctionData
 		for (idx_t c = 2; c < ncol; ++c) {
 			if (c > 2)
 				rest.push_back('\t');
-			Value v = input.GetValue(c, r);
-			if (!v.IsNull())
-				rest += v.ToString();
+			const idx_t vi = cols[c].sel->get_index(r);
+			if (cols[c].validity.RowIsValid(vi)) {
+				const string_t &v = UnifiedVectorFormat::GetData<string_t>(cols[c])[vi];
+				rest.append(v.GetData(), v.GetSize());
+			}
 		}
 
 		if (bd.format == GorWriteFormat::GORZ) {
@@ -1518,7 +1624,13 @@ void GorCopySink(ExecutionContext &, FunctionData &bind_data, GlobalFunctionData
 			gs.out->put('\n');
 		}
 
-		gs.lastChrom = chrom;
+		if (!gs.haveLast) {
+			gs.firstChrom.assign(chrom.data(), chrom.size());
+			gs.firstPos = pos;
+		}
+		if (!sameChrom) {
+			gs.lastChrom.assign(chrom.data(), chrom.size());
+		}
 		gs.lastPos = pos;
 		gs.haveLast = true;
 		gs.rowsWritten++;
@@ -1529,14 +1641,41 @@ void GorCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, Lo
 	// Nothing to merge — the single global state does all writing.
 }
 
-void GorCopyFinalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate) {
+void GorCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &bd = bind_data.Cast<GorCopyBindData>();
 	auto &gs = gstate.Cast<GorCopyGlobalState>();
 	if (gs.gorzWriter) {
 		gs.gorzWriter->close(); // flush the final block
+		gs.gorzWriter.reset();
 	}
 	if (gs.out) {
-		gs.out->flush(); // FileHandle closes when the stream (owning it) is destroyed
+		gs.out->flush();
+		gs.out.reset(); // closes the FileHandle: the data file is complete before any sidecar
 	}
+	if (!bd.writeMeta) {
+		return;
+	}
+	// The GOR .meta sidecar (see lib/gorz MetaFile.h for the format).
+	std::string meta = "## SERIAL = 0\n## COLUMNS = ";
+	for (idx_t i = 0; i < bd.names.size(); ++i) {
+		if (i)
+			meta.push_back(',');
+		meta += bd.names[i];
+	}
+	meta += "\n## SCHEMA = ";
+	for (idx_t i = 0; i < bd.sqlTypes.size(); ++i) {
+		if (i)
+			meta.push_back(',');
+		meta.push_back(gorSchemaLetter(bd.sqlTypes[i]));
+	}
+	meta += "\n## LINE_COUNT = " + std::to_string(gs.rowsWritten) + "\n";
+	if (gs.rowsWritten > 0) {
+		// First and last row actually written — what a dictionary's range columns hold.
+		meta += "## RANGE = " + gs.firstChrom + "\t" + std::to_string(gs.firstPos) + "\t" + gs.lastChrom + "\t" +
+		        std::to_string(gs.lastPos) + "\n";
+	}
+	meta += "## TAGS = \n## MD5 = " + gs.md5.FinishHex() + "\n";
+	writeTextFile(FileSystem::GetFileSystem(context), gs.path + ".meta", meta);
 }
 
 CopyFunctionExecutionMode GorCopyExecMode(bool /*preserve_insertion_order*/, bool /*supports_batch_index*/) {
@@ -1544,6 +1683,578 @@ CopyFunctionExecutionMode GorCopyExecMode(bool /*preserve_insertion_order*/, boo
 	// .gorz/.gor is inherently sequential, and out-of-order chunks would trip
 	// the order validation.
 	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
+// ===========================================================================
+// COPY (query) TO 'x.gord' (FORMAT gord [, SPLIT 'chrom' | <n>] [, OVERWRITE])
+//
+// Writes a GOR dictionary FOLDER — what `pgor ... | write x.gord` produces:
+// one .gorz (+ .gorz.meta) per genomic range and the dictionary itself as
+// x.gord/thedict.gord. The query needs no ORDER BY and may arrive in any order.
+//
+// Two stages, both behind the one COPY statement:
+//   1. The query runs ONCE, in the caller's connection (so temp tables, views
+//      and CTEs resolve as usual), and is written as hive-partitioned parquet
+//      into a staging directory — one partition per (chrom, bin). The COPY
+//      `plan` hook rewrites the statement into exactly that parquet COPY.
+//   2. An operator placed above it then sorts and writes each partition on
+//      internal connections — `ORDER BY pos` + COPY (FORMAT gorz, META) — a few
+//      partitions at a time. The ranges are disjoint, so nothing is merged and
+//      no sort ever sees more than one partition. Finally the dictionary is
+//      assembled from the .meta sidecars (as GOR's writeDictionaryFromMeta
+//      does) and written LAST: a folder without thedict.gord is not a result.
+//
+// SPLIT follows `pgor -split`: 'chrom' (default) is one file per chromosome;
+// n <= 1000 is n genome partitions (a step of 3e9/n bases within each
+// chromosome); n > 1000 is the step in bases. A file never spans chromosomes,
+// and ranges that hold no rows produce no file.
+// ===========================================================================
+
+const char *const GORD_DICT_NAME = "thedict.gord";
+const char *const GORD_CHROM_KEY = "__gord_chrom";
+const char *const GORD_BIN_KEY = "__gord_bin";
+// pgor's own ceiling on the number of splits (gor.validation.split.maxcount).
+constexpr idx_t GORD_MAX_PARTITIONS = 5000;
+// Staging row groups are kept small: every open partition writer buffers up to
+// one, and many partitions can be open at once.
+constexpr idx_t GORD_STAGING_ROW_GROUP = 20000;
+// Sorting a partition takes roughly this many times its staged (compressed
+// parquet) size in memory; used to decide how many partitions run at once.
+constexpr idx_t GORD_SORT_MEMORY_FACTOR = 6;
+
+struct GordWriteSpec {
+	std::string outDir;     // the x.gord folder
+	std::string stagingDir; // partitioned parquet lives here until stage 2 is done
+	int64_t step = 0;       // bases per file; 0 → one file per chromosome
+	bool overwrite = false;
+	bool remote = false;        // object store: no directories to create or probe
+	vector<string> columnNames; // the query's columns → ## COLUMNS
+};
+
+std::string sqlQuote(const std::string &s) {
+	return "'" + StringUtil::Replace(s, "'", "''") + "'";
+}
+
+// Files a .gord folder may hold. OVERWRITE refuses to delete a directory that
+// holds anything else, so a mistyped path cannot take unrelated data with it.
+bool isGordFolderFile(const std::string &name) {
+	if (name == GORD_DICT_NAME || (!name.empty() && name[0] == '.')) {
+		return true;
+	}
+	for (const char *suffix : {".gorz", ".gorz.meta", ".gorz.gori", ".gorz.md5", ".gord"}) {
+		if (StringUtil::EndsWith(name, suffix)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Check the COPY target before any work is done (and again right before it is
+// replaced). Returns true when something is there that OVERWRITE must remove.
+bool checkGordTarget(FileSystem &fs, const GordWriteSpec &spec) {
+	if (spec.remote) {
+		return false;
+	}
+	if (fs.FileExists(spec.outDir)) {
+		if (!spec.overwrite) {
+			throw IOException("gord COPY: \"%s\" already exists (use OVERWRITE to replace it)", spec.outDir);
+		}
+		return true;
+	}
+	if (!fs.DirectoryExists(spec.outDir)) {
+		return false;
+	}
+	bool empty = true;
+	std::string foreign;
+	fs.ListFiles(spec.outDir, [&](const string &name, bool isDir) {
+		empty = false;
+		if (foreign.empty() && (isDir || !isGordFolderFile(name))) {
+			foreign = name;
+		}
+	});
+	if (empty) {
+		return false;
+	}
+	if (!spec.overwrite) {
+		throw IOException("gord COPY: directory \"%s\" already exists and is not empty (use OVERWRITE to replace it)",
+		                  spec.outDir);
+	}
+	if (!foreign.empty()) {
+		throw IOException("gord COPY: refusing to OVERWRITE \"%s\": it holds \"%s\", which is not part of a .gord "
+		                  "folder",
+		                  spec.outDir, foreign);
+	}
+	return true;
+}
+
+// One staged partition = one output .gorz.
+struct GordPartition {
+	std::string chrom;
+	int64_t bin = 0;
+	vector<string> stagedFiles;
+	idx_t stagedBytes = 0;
+	std::string fileName; // relative to the folder
+};
+
+// The staged partitions in GOR order (chrom lexicographic, then bin), read off
+// the hive directory names: <staging>/__gord_chrom=<c>/__gord_bin=<b>/*.parquet.
+vector<GordPartition> listGordPartitions(FileSystem &fs, const GordWriteSpec &spec) {
+	std::map<std::pair<std::string, int64_t>, GordPartition> byKey;
+	for (auto &file : fs.Glob(spec.stagingDir + "/*/*/*.parquet")) {
+		auto keys = HivePartitioning::Parse(file.path);
+		auto chromIt = keys.find(GORD_CHROM_KEY);
+		auto binIt = keys.find(GORD_BIN_KEY);
+		if (chromIt == keys.end() || binIt == keys.end()) {
+			throw InternalException("gord COPY: unexpected staging file %s", file.path);
+		}
+		if (HivePartitioning::IsNull(chromIt->second) || HivePartitioning::IsNull(binIt->second)) {
+			throw InvalidInputException("gord COPY: chrom (column 1) and pos (column 2) must not be NULL");
+		}
+		GordPartition part;
+		part.chrom = HivePartitioning::Unescape(chromIt->second);
+		if (part.chrom.empty()) {
+			throw InvalidInputException("gord COPY: chrom (column 1) must not be empty");
+		}
+		part.bin = std::stoll(binIt->second);
+		auto &slot = byKey.emplace(std::make_pair(part.chrom, part.bin), std::move(part)).first->second;
+		slot.stagedFiles.push_back(file.path);
+		slot.stagedBytes += NumericCast<idx_t>(fs.OpenFile(file.path, FileOpenFlags::FILE_FLAGS_READ)->GetFileSize());
+	}
+	if (byKey.size() > GORD_MAX_PARTITIONS) {
+		throw InvalidInputException("gord COPY: SPLIT gives %llu files, more than the limit of %llu — use a larger "
+		                            "SPLIT",
+		                            (unsigned long long)byKey.size(), (unsigned long long)GORD_MAX_PARTITIONS);
+	}
+	vector<GordPartition> parts;
+	std::unordered_set<std::string> used;
+	for (auto &entry : byKey) {
+		auto &part = entry.second;
+		// <chrom>[_<bpstart>_<bpstop>].gorz, 0-based like pgor's #{BPSTART}/#{BPSTOP}.
+		// The dictionary is the source of truth, so the name only has to be unique
+		// and filesystem-safe.
+		std::string stem;
+		for (char ch : part.chrom) {
+			const bool safe = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+			                  ch == '.' || ch == '-' || ch == '_';
+			stem.push_back(safe ? ch : '_');
+		}
+		if (stem.empty() || stem[0] == '.') {
+			stem.insert(stem.begin(), '_');
+		}
+		if (spec.step > 0) {
+			stem += "_" + std::to_string(part.bin * spec.step) + "_" + std::to_string((part.bin + 1) * spec.step - 1);
+		}
+		std::string name = stem + ".gorz";
+		for (idx_t n = 2; !used.insert(name).second; ++n) {
+			name = stem + "_" + std::to_string(n) + ".gorz";
+		}
+		part.fileName = name;
+		parts.push_back(std::move(part));
+	}
+	return parts;
+}
+
+// Stage 2. Returns the number of rows written.
+idx_t writeGordFolder(ClientContext &context, const GordWriteSpec &spec) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto parts = listGordPartitions(fs, spec);
+
+	// Replace the target only now that the whole input is safely staged.
+	if (checkGordTarget(fs, spec)) {
+		if (fs.FileExists(spec.outDir)) {
+			fs.RemoveFile(spec.outDir);
+		} else {
+			fs.RemoveDirectory(spec.outDir);
+		}
+	}
+	bool createdDir = false;
+	if (!spec.remote && !fs.DirectoryExists(spec.outDir)) {
+		fs.CreateDirectory(spec.outDir);
+		createdDir = true;
+	}
+
+	// Sort + write the partitions on internal connections, several at a time.
+	// Each COPY is single-threaded in its gorz sink, so running partitions side
+	// by side is what spreads the compression across cores. The connections only
+	// read the staged parquet, never the caller's (possibly temporary) tables.
+	const idx_t nWorkers = MaxValue<idx_t>(
+	    1, MinValue<idx_t>(parts.size(), NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads())));
+	vector<unique_ptr<Connection>> connections;
+	for (idx_t i = 0; i < nWorkers; ++i) {
+		connections.push_back(make_uniq<Connection>(DatabaseInstance::GetDatabase(context)));
+	}
+	// How many run at once is also capped by memory: a partition is admitted only
+	// while the estimated footprint of those in flight stays within a share of
+	// memory_limit (one always runs, and DuckDB's sort spills if that one alone
+	// is too big). Large partitions therefore run fewer at a time.
+	const idx_t memoryBudget = BufferManager::GetBufferManager(context).GetMaxMemory() / 10 * 6;
+	std::mutex admitLock;
+	std::condition_variable admitted;
+	idx_t nextPart = 0;
+	idx_t activeParts = 0;
+	idx_t activeBytes = 0;
+	std::atomic<idx_t> running {nWorkers};
+	std::atomic<bool> stop {false};
+	std::mutex errorLock;
+	ErrorData firstError;
+	auto fail = [&](ErrorData error) {
+		{
+			std::lock_guard<std::mutex> guard(errorLock);
+			if (!firstError.HasError()) {
+				firstError = std::move(error);
+			}
+		}
+		stop = true;
+		admitted.notify_all();
+	};
+	// Claim the next partition once it fits; false when there is nothing left.
+	auto claim = [&](idx_t &index, idx_t &cost) {
+		std::unique_lock<std::mutex> guard(admitLock);
+		while (!stop && nextPart < parts.size()) {
+			cost = parts[nextPart].stagedBytes * GORD_SORT_MEMORY_FACTOR;
+			if (activeParts == 0 || activeBytes + cost <= memoryBudget) {
+				index = nextPart++;
+				activeBytes += cost;
+				++activeParts;
+				return true;
+			}
+			admitted.wait(guard);
+		}
+		return false;
+	};
+	auto release = [&](idx_t cost) {
+		{
+			std::lock_guard<std::mutex> guard(admitLock);
+			activeBytes -= cost;
+			--activeParts;
+		}
+		admitted.notify_all();
+	};
+	auto work = [&](idx_t worker) {
+		idx_t i = 0;
+		idx_t cost = 0;
+		while (claim(i, cost)) {
+			try {
+				std::string files;
+				for (auto &f : parts[i].stagedFiles) {
+					files += (files.empty() ? "" : ", ") + sqlQuote(f);
+				}
+				// chrom is constant within a partition, so pos alone is the sort key.
+				auto result = connections[worker]->Query(
+				    "COPY (SELECT * FROM read_parquet([" + files + "], hive_partitioning = false) ORDER BY 2) TO " +
+				    sqlQuote(fs.JoinPath(spec.outDir, parts[i].fileName)) + " (FORMAT gorz, META)");
+				if (result->HasError()) {
+					fail(result->GetErrorObject());
+				}
+			} catch (std::exception &e) {
+				fail(ErrorData(e));
+			}
+			release(cost);
+		}
+		--running;
+	};
+	vector<std::thread> threads;
+	for (idx_t i = 0; i < nWorkers; ++i) {
+		threads.emplace_back(work, i);
+	}
+	// Wait, relaying an interrupt of the caller's query to the internal ones.
+	bool interrupted = false;
+	while (running > 0) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		if (!interrupted && context.interrupted) {
+			interrupted = true;
+			stop = true;
+			admitted.notify_all();
+			for (auto &con : connections) {
+				con->Interrupt();
+			}
+		}
+	}
+	for (auto &t : threads) {
+		t.join();
+	}
+
+	auto discardOutput = [&]() {
+		try {
+			if (createdDir) {
+				fs.RemoveDirectory(spec.outDir);
+				return;
+			}
+			for (auto &part : parts) {
+				for (const char *suffix : {"", ".meta"}) {
+					fs.TryRemoveFile(fs.JoinPath(spec.outDir, part.fileName) + suffix);
+				}
+			}
+		} catch (...) {
+			// best effort — the original error is what the caller needs to see
+		}
+	};
+	if (interrupted) {
+		discardOutput();
+		throw InterruptException();
+	}
+	if (firstError.HasError()) {
+		discardOutput();
+		firstError.Throw("gord COPY: ");
+	}
+
+	// The dictionary: GOR's folder header, then one line per file with the alias
+	// 1..N and the range of rows actually written (from the file's .meta).
+	std::string dict = "## SERIAL = 0\n## LINE_FILTER = false\n## COLUMNS = ";
+	for (idx_t i = 0; i < spec.columnNames.size(); ++i) {
+		dict += (i ? "," : "") + spec.columnNames[i];
+	}
+	dict += "\n#File\tSource\tChrStart\tPosStart\tChrStop\tPosStop\tTags\n";
+	idx_t rows = 0;
+	try {
+		auto opener = makeFsOpener(context);
+		idx_t alias = 0;
+		for (auto &part : parts) {
+			auto meta = gorz::parseMetaFile(fs.JoinPath(spec.outDir, part.fileName) + ".meta", opener);
+			auto range = meta.properties.find("RANGE");
+			if (!meta.lineCount.has_value() || range == meta.properties.end()) {
+				throw IOException("gord COPY: missing or incomplete %s.meta", part.fileName);
+			}
+			rows += NumericCast<idx_t>(*meta.lineCount);
+			dict += part.fileName + "\t" + std::to_string(++alias) + "\t" + range->second + "\t\n";
+		}
+		// Written last, and (where the store can rename) atomically.
+		const std::string dictPath = fs.JoinPath(spec.outDir, GORD_DICT_NAME);
+		if (spec.remote) {
+			writeTextFile(fs, dictPath, dict);
+		} else {
+			writeTextFile(fs, dictPath + ".tmp", dict);
+			fs.MoveFile(dictPath + ".tmp", dictPath);
+		}
+	} catch (...) {
+		discardOutput();
+		throw;
+	}
+	return rows;
+}
+
+// Removes the staging directory when the physical plan goes away — the path
+// taken when stage 1 itself fails and stage 2 (which normally removes it) never
+// runs.
+struct GordStagingGuard {
+	GordStagingGuard(weak_ptr<DatabaseInstance> db_p, std::string dir_p) : db(std::move(db_p)), dir(std::move(dir_p)) {
+	}
+	~GordStagingGuard() {
+		try {
+			if (auto instance = db.lock()) {
+				auto &fs = FileSystem::GetFileSystem(*instance);
+				if (fs.DirectoryExists(dir)) {
+					fs.RemoveDirectory(dir);
+				}
+			}
+		} catch (...) {
+			// nothing useful to do from a destructor
+		}
+	}
+	weak_ptr<DatabaseInstance> db;
+	std::string dir;
+};
+
+struct GordWriteGlobalState : public GlobalSinkState {
+	idx_t rowCount = 0;
+};
+
+// Sits above the stage-1 parquet COPY: swallows its row count, runs stage 2
+// once it has finished, and reports the rows written like any other COPY.
+class PhysicalGordWrite : public PhysicalOperator {
+public:
+	PhysicalGordWrite(PhysicalPlan &physical_plan, vector<LogicalType> types, GordWriteSpec spec_p,
+	                  shared_ptr<GordStagingGuard> guard_p)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), 1),
+	      spec(std::move(spec_p)), guard(std::move(guard_p)) {
+	}
+
+	GordWriteSpec spec;
+	shared_ptr<GordStagingGuard> guard;
+
+public:
+	string GetName() const override {
+		return "GORD_WRITE";
+	}
+	bool IsSink() const override {
+		return true;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
+		return make_uniq<GordWriteGlobalState>();
+	}
+	SinkResultType Sink(ExecutionContext &, DataChunk &, OperatorSinkInput &) const override {
+		return SinkResultType::NEED_MORE_INPUT; // stage 1's row count; stage 2 recounts
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override {
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto dropStaging = [&]() {
+			if (fs.DirectoryExists(spec.stagingDir)) {
+				fs.RemoveDirectory(spec.stagingDir);
+			}
+		};
+		try {
+			input.global_state.Cast<GordWriteGlobalState>().rowCount = writeGordFolder(context, spec);
+		} catch (...) {
+			try {
+				dropStaging();
+			} catch (...) {
+				// keep the original error
+			}
+			throw;
+		}
+		dropStaging();
+		return SinkFinalizeType::READY;
+	}
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const override {
+		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<GordWriteGlobalState>().rowCount)));
+		chunk.SetCardinality(1);
+		return SourceResultType::FINISHED;
+	}
+};
+
+struct LogicalGordWrite : public LogicalExtensionOperator {
+	explicit LogicalGordWrite(GordWriteSpec spec_p) : spec(std::move(spec_p)) {
+	}
+	GordWriteSpec spec;
+
+	string GetName() const override {
+		return "GORD_WRITE";
+	}
+	string GetExtensionName() const override {
+		return "gorz";
+	}
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto &child = planner.CreatePlan(*children[0]);
+		auto guard = make_shared_ptr<GordStagingGuard>(context.db, spec.stagingDir);
+		auto &op = planner.Make<PhysicalGordWrite>(types, spec, std::move(guard));
+		op.children.push_back(child);
+		return op;
+	}
+
+protected:
+	void ResolveTypes() override {
+		types = {LogicalType::BIGINT};
+	}
+};
+
+// Parent directory of `path` ("." when it has none) and its last component.
+std::pair<std::string, std::string> splitParent(const std::string &path) {
+	auto sep = path.find_last_of("/\\");
+	if (sep == std::string::npos) {
+		return {".", path};
+	}
+	return {sep == 0 ? path.substr(0, 1) : path.substr(0, sep), path.substr(sep + 1)};
+}
+
+// The COPY `plan` hook for FORMAT gord: rewrite the statement into the stage-1
+// partitioned parquet COPY (bound here, in the caller's binder) and put the
+// stage-2 operator on top of it.
+BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
+	auto &context = binder.context;
+	auto &info = *stmt.info;
+	auto &fs = FileSystem::GetFileSystem(context);
+
+	GordWriteSpec spec;
+	spec.outDir = info.file_path;
+	while (spec.outDir.size() > 1 && (spec.outDir.back() == '/' || spec.outDir.back() == '\\')) {
+		spec.outDir.pop_back();
+	}
+	spec.remote = FileSystem::IsRemoteFile(spec.outDir);
+	std::string stagingParent;
+	for (auto &opt : info.options) {
+		const auto name = StringUtil::Lower(opt.first);
+		if (name == "split") {
+			if (opt.second.size() != 1 || opt.second[0].IsNull()) {
+				throw BinderException("gord COPY: SPLIT takes 'chrom' or a number");
+			}
+			const Value &v = opt.second[0];
+			if (v.type().id() == LogicalTypeId::VARCHAR && StringUtil::CIEquals(v.ToString(), "chrom")) {
+				continue;
+			}
+			int64_t n = 0;
+			try {
+				n = v.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+			} catch (std::exception &) {
+				throw BinderException("gord COPY: SPLIT takes 'chrom' or a number, got '%s'", v.ToString());
+			}
+			if (n <= 0) {
+				throw BinderException("gord COPY: SPLIT must be positive");
+			}
+			// pgor -split: up to 1000 is a number of genome partitions, above that a size in bases.
+			spec.step = n <= 1000 ? 3000000000LL / n : n;
+		} else if (name == "overwrite" || name == "overwrite_or_ignore") {
+			spec.overwrite = copyBoolOption(opt.second);
+		} else if (name == "staging") {
+			if (opt.second.size() != 1 || opt.second[0].IsNull()) {
+				throw BinderException("gord COPY: STAGING takes a directory path");
+			}
+			stagingParent = opt.second[0].ToString();
+		} else {
+			throw BinderException("gord COPY: unknown option \"%s\" (expected SPLIT, OVERWRITE or STAGING)", opt.first);
+		}
+	}
+	checkGordTarget(fs, spec); // fail before running the query, not after
+
+	// Staging goes next to the output unless told otherwise; an object-store
+	// target stages in DuckDB's local temp directory instead.
+	const auto outParts = splitParent(spec.outDir);
+	if (stagingParent.empty()) {
+		if (!spec.remote) {
+			stagingParent = outParts.first;
+		} else {
+			Value tempDir;
+			if (context.TryGetCurrentSetting("temp_directory", tempDir) && !tempDir.IsNull()) {
+				stagingParent = tempDir.ToString();
+			}
+			if (stagingParent.empty()) {
+				throw BinderException("gord COPY: no temp_directory to stage in — pass STAGING '<local directory>'");
+			}
+			fs.CreateDirectoriesRecursive(stagingParent);
+		}
+	}
+	if (!fs.DirectoryExists(stagingParent)) {
+		throw IOException("gord COPY: directory \"%s\" does not exist", stagingParent);
+	}
+	spec.stagingDir =
+	    fs.JoinPath(stagingParent, "." + outParts.second + ".staging-" + UUID::ToString(UUID::GenerateRandomUUID()));
+
+	// Stage 1. `#1` / `#2` are the query's chrom and pos whatever they are named;
+	// the two partition keys are not written into the staged files.
+	const std::string bin = spec.step > 0 ? "#2 // " + std::to_string(spec.step) : "0";
+	const std::string sql = "COPY (SELECT *, #1 AS " + std::string(GORD_CHROM_KEY) + ", " + bin + " AS " +
+	                        GORD_BIN_KEY + " FROM (" + info.select_statement->ToString() + ") AS __gord_query) TO " +
+	                        sqlQuote(spec.stagingDir) + " (FORMAT parquet, PARTITION_BY (" + GORD_CHROM_KEY + ", " +
+	                        GORD_BIN_KEY + "), ROW_GROUP_SIZE " + std::to_string(GORD_STAGING_ROW_GROUP) + ")";
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(sql);
+	auto bound = binder.Bind(*parser.statements[0]);
+	if (bound.plan->type != LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
+		throw InternalException("gord COPY: unexpected staging plan");
+	}
+	auto &staging = bound.plan->Cast<LogicalCopyToFile>();
+	const idx_t nCols = staging.names.size() - 2; // minus the two partition keys
+	if (nCols < 2) {
+		throw BinderException("COPY ... TO (FORMAT gord): need at least 2 columns (chrom, pos); got %llu",
+		                      (unsigned long long)nCols);
+	}
+	if (staging.expected_types[0].id() != LogicalTypeId::VARCHAR) {
+		throw BinderException("COPY ... TO (FORMAT gord): first column '%s' (chrom) must be VARCHAR, got %s",
+		                      staging.names[0], staging.expected_types[0].ToString());
+	}
+	if (!staging.expected_types[1].IsIntegral()) {
+		throw BinderException("COPY ... TO (FORMAT gord): second column '%s' (pos) must be an integer type, got %s",
+		                      staging.names[1], staging.expected_types[1].ToString());
+	}
+	spec.columnNames.assign(staging.names.begin(), staging.names.begin() + NumericCast<int64_t>(nCols));
+
+	auto write = make_uniq<LogicalGordWrite>(std::move(spec));
+	write->children.push_back(std::move(bound.plan));
+	bound.plan = std::move(write);
+	return bound;
 }
 
 } // namespace
@@ -1589,7 +2300,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	// COPY (SELECT ... ORDER BY chrom, pos) TO 'x.gorz' (FORMAT gorz)
 	//   and the plain-text FORMAT gor. Registering `extension` also makes the
 	//   bare `COPY ... TO 'x.gorz'` (format inferred from the suffix) work.
-	//   Single-threaded, single file; validates GOR order, no sidecars.
+	//   Single-threaded, single file; validates GOR order; META adds the
+	//   .meta sidecar.
 	auto registerCopy = [&](const char *name, const char *ext, duckdb::copy_to_bind_t bindFn) {
 		duckdb::CopyFunction cf(name);
 		cf.extension = ext;
@@ -1604,6 +2316,14 @@ void LoadInternal(ExtensionLoader &loader) {
 	};
 	registerCopy("gorz", "gorz", duckdb::GorzCopyBind);
 	registerCopy("gor", "gor", duckdb::GorPlainCopyBind);
+
+	// COPY (query) TO 'x.gord' (FORMAT gord, SPLIT ...) — a dictionary folder,
+	//   written in two stages behind the one statement (see GordCopyPlan). It
+	//   has no sink of its own: the `plan` hook replaces the whole statement.
+	duckdb::CopyFunction gordCopy("gord");
+	gordCopy.extension = "gord";
+	gordCopy.plan = duckdb::GordCopyPlan;
+	loader.RegisterFunction(gordCopy);
 
 	// Replacement scan goes through the DatabaseInstance config (no
 	// ExtensionLoader method exists yet — see PR 17772). One scan rewrites
