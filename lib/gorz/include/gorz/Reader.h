@@ -158,6 +158,9 @@ private:
     // blocks land here directly; columnar blocks are run through
     // BlockPacker::decodeBlock first.
     std::vector<uint8_t> blockBytes_;
+    // The raw (still encoded) block line as read from the stream; reused
+    // across blocks so reading one costs no allocation.
+    std::string blockLine_;
     std::size_t blockCursor_ = 0;
     std::size_t blockEnd_ = 0;
 

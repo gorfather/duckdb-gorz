@@ -28,6 +28,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/copy_function.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -319,6 +320,15 @@ protected:
 		}
 		if (target < 0 || target > fileSize_) {
 			return pos_type(off_type(-1));
+		}
+		// A target inside the bytes already buffered (which includes every
+		// tellg(), a seek of 0 from the current position) just moves the get
+		// pointer. Dropping the buffer here made each tellg() cost a fresh
+		// 64 KiB read — once per block on the parallel .gorz scan.
+		const int64_t buffered = static_cast<int64_t>(egptr() - eback());
+		if (target >= bufFileStart_ && target <= bufFileStart_ + buffered) {
+			setg(eback(), eback() + (target - bufFileStart_), egptr());
+			return pos_type(target);
 		}
 		handle_->Seek(static_cast<idx_t>(target));
 		bufFileStart_ = target;
@@ -1122,13 +1132,14 @@ void storeField(DataChunk &output, idx_t col, idx_t row, const LogicalType &type
 			FlatVector::SetNull(output.data[col], row, true);
 			break;
 		}
-		// std::from_chars for double is C++17 but historically lagged in
-		// libstdc++/libc++; std::stod is the safe fallback. Construct a
-		// null-terminated string from the view for stod's API.
-		std::string tmp(field);
-		try {
-			FlatVector::GetData<double>(output.data[col])[row] = std::stod(tmp);
-		} catch (...) {
+		// DuckDB's own VARCHAR -> DOUBLE cast (fast_float). Not std::stod: that
+		// goes through strtod, which takes a process-wide locale lock on macOS,
+		// so parallel scans of DOUBLE columns queued up behind one another.
+		double v = 0;
+		if (TryCast::Operation<string_t, double>(string_t(field.data(), UnsafeNumericCast<uint32_t>(field.size())), v,
+		                                         false)) {
+			FlatVector::GetData<double>(output.data[col])[row] = v;
+		} else {
 			FlatVector::SetNull(output.data[col], row, true);
 		}
 		break;

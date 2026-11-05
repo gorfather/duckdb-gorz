@@ -361,30 +361,39 @@ bool Reader::readNextBlock() {
     }
 
     // Block on disk: <chr>\t<pos>\t<flag-byte><encoded-payload>\n
-    std::vector<uint8_t> chr, pos;
-    if (!readUntil(in_, '\t', chr)) return false;  // clean EOF
-    if (!readUntil(in_, '\t', pos)) {
+    //
+    // Pull the whole block line in with one getline rather than a get() per
+    // byte (a sentry + virtual-ish call each — it used to be a fifth of the
+    // read CPU). The base128 payload never contains '\n', so the line is the
+    // block. A last block without its terminator is still accepted.
+    if (!std::getline(in_, blockLine_, '\n')) return false;  // clean EOF
+    const char* line = blockLine_.data();
+    const std::size_t lineLen = blockLine_.size();
+    const char* tab1 = static_cast<const char*>(std::memchr(line, '\t', lineLen));
+    if (!tab1) {
         throw FormatError("truncated block: missing pos field");
     }
-
-    int flagInt = in_.get();
-    if (flagInt == EOF) {
+    const std::size_t afterChr = static_cast<std::size_t>(tab1 - line) + 1;
+    const char* tab2 = static_cast<const char*>(
+        std::memchr(line + afterChr, '\t', lineLen - afterChr));
+    if (!tab2) {
+        throw FormatError("truncated block: missing pos field");
+    }
+    const std::size_t flagAt = static_cast<std::size_t>(tab2 - line) + 1;
+    if (flagAt >= lineLen) {
         throw FormatError("truncated block: missing flag byte");
     }
-    const uint8_t flagByte = static_cast<uint8_t>(flagInt);
+    const uint8_t flagByte = static_cast<uint8_t>(line[flagAt]);
     const bool columnar = (flagByte & 0x01) != 0;
     const bool zstd = (flagByte & 0x02) != 0;
 
-    std::vector<uint8_t> encoded;
-    if (!readUntil(in_, '\n', encoded)) {
-        throw FormatError("truncated block: missing payload / terminator");
-    }
-    if (encoded.empty()) {
+    const uint8_t* encoded = reinterpret_cast<const uint8_t*>(line) + flagAt + 1;
+    const std::size_t encodedLen = lineLen - flagAt - 1;
+    if (encodedLen == 0) {
         throw FormatError("empty block payload");
     }
 
-    std::vector<uint8_t> compressed =
-        base128_decode(encoded.data(), encoded.size());
+    std::vector<uint8_t> compressed = base128_decode(encoded, encodedLen);
     std::vector<uint8_t> decompressed;
     if (zstd) {
         decompressed = inflate_zstd(compressed.data(), compressed.size());
