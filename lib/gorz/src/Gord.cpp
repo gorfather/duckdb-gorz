@@ -70,6 +70,17 @@ std::string resolvePath(const std::string& raw, const std::string& dictParent) {
     namespace fs = std::filesystem;
     fs::path p(raw);
     if (p.is_absolute()) return raw;
+    // Object-store URLs (s3://bucket/key, gcs://…) are not filesystem paths:
+    // lexically_normal() would collapse the "//" after the scheme. An entry
+    // that is itself a URL is taken as is; a relative one is joined onto the
+    // dictionary's URL as text.
+    if (raw.find("://") != std::string::npos) return raw;
+    if (dictParent.find("://") != std::string::npos) {
+        std::size_t skip = 0;
+        while (raw.compare(skip, 2, "./") == 0) skip += 2;
+        const bool slash = !dictParent.empty() && dictParent.back() == '/';
+        return dictParent + (slash ? "" : "/") + raw.substr(skip);
+    }
     return (fs::path(dictParent) / p).lexically_normal().string();
 }
 
