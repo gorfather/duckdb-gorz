@@ -106,3 +106,14 @@ COPY (SELECT * FROM (VALUES ('chr1', 'x', 'A')) t(chrom, pos, ref))
   TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
 ----
 must be an integer type
+
+# --- every table function documents itself -----------------------------------
+# duckdb_functions() (and the community registry page) show a description and
+# examples for each, next to its real parameter names.
+query TTTI
+SELECT function_name, list_sort(parameters)::VARCHAR, description IS NOT NULL AND description <> '', len(examples)
+FROM duckdb_functions() WHERE function_name IN ('read_gor', 'read_gorz', 'read_gord') ORDER BY 1;
+----
+read_gor	[col0, f, ff, range, source]	true	2
+read_gord	[col0, f, ff, range, source]	true	2
+read_gorz	[col0, f, ff, range, source]	true	2
