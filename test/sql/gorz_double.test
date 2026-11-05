@@ -1,0 +1,67 @@
+# name: test/sql/gorz_double.test
+# description: DOUBLE columns (declared by a .meta SCHEMA) parse with DuckDB's own cast, single-threaded and on the parallel byte-range scan
+# group: [sql]
+
+require gorz
+
+# A value column written as text, typed D by a hand-written .meta sidecar.
+statement ok
+COPY (SELECT * FROM (VALUES ('chr1', 1, '1.5'), ('chr1', 2, '-2e-3'), ('chr1', 3, ''), ('chr1', 4, '7'),
+                            ('chr1', 5, '1.5abc'), ('chr1', 6, 'abc'), ('chr1', 7, ' 0.25 '))
+        t(chrom, pos, af) ORDER BY chrom, pos)
+  TO '__TEST_DIR__/d.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT '## SCHEMA = S,I,D' AS line) TO '__TEST_DIR__/d.gorz.meta' (FORMAT csv, HEADER false, QUOTE '');
+
+query T
+SELECT typeof(af) FROM '__TEST_DIR__/d.gorz' LIMIT 1;
+----
+DOUBLE
+
+# Empty and unparseable fields are NULL (a number followed by junk is not a number).
+query IR
+SELECT pos, af FROM '__TEST_DIR__/d.gorz' ORDER BY pos;
+----
+1	1.5
+2	-0.002
+3	NULL
+4	7.0
+5	NULL
+6	NULL
+7	0.25
+
+# Many blocks, read through the parallel byte-range scan: every double comes
+# back exactly, whichever range its block falls in.
+statement ok
+CREATE TABLE src AS
+SELECT 'chr' || (i // 20000 + 1) AS chrom, (i % 20000 + 1)::INTEGER AS pos, (i * 7 % 1000003) / 1000.0 AS af,
+       repeat('ACGT', 20) || i AS seq
+FROM range(60000) t(i);
+
+statement ok
+COPY (SELECT chrom, pos, af::VARCHAR AS af, seq FROM src ORDER BY chrom, pos) TO '__TEST_DIR__/p.gorz' (FORMAT gorz);
+
+statement ok
+COPY (SELECT '## SCHEMA = S,I,D,S' AS line) TO '__TEST_DIR__/p.gorz.meta' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET gorz_scan_chunk_bytes = 4096;
+
+query I
+SELECT count(*) FROM (
+    (SELECT chrom, pos, af, seq FROM src EXCEPT ALL SELECT * FROM read_gorz('__TEST_DIR__/p.gorz'))
+    UNION ALL
+    (SELECT * FROM read_gorz('__TEST_DIR__/p.gorz') EXCEPT ALL SELECT chrom, pos, af, seq FROM src));
+----
+0
+
+# A seek (WHERE on chrom/pos) lands on the right rows too.
+query IR
+SELECT pos, af FROM read_gorz('__TEST_DIR__/p.gorz') WHERE chrom = 'chr2' AND pos BETWEEN 10 AND 11;
+----
+10	140.063
+11	140.07
