@@ -32,6 +32,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -1553,7 +1554,11 @@ void LoadInternal(ExtensionLoader &loader) {
 	//     would be silently dropped → wrong results.)
 	//   * projection_pushdown — init_global receives the pruned column_ids and
 	//     Execute only materialises those columns.
-	auto registerGor = [&](const char *name, duckdb::table_function_bind_t bindFn) {
+	//
+	// Each carries a description and examples: they are what duckdb_functions()
+	// — and the extension's page in the community registry — show for it.
+	auto registerGor = [&](const char *name, duckdb::table_function_bind_t bindFn, const char *description,
+	                       duckdb::vector<std::string> examples) {
 		duckdb::TableFunction tf(name, {duckdb::LogicalType::VARCHAR}, duckdb::ReadGorExecute, bindFn,
 		                         duckdb::ReadGorInitGlobal, duckdb::ReadGorInitLocal);
 		tf.pushdown_complex_filter = duckdb::seekHintComplexPushdown<duckdb::GorBindData>;
@@ -1569,11 +1574,37 @@ void LoadInternal(ExtensionLoader &loader) {
 		tf.named_parameters["range"] = duckdb::LogicalType::VARCHAR;
 		// GOR -s: rename the exposed source column (GORD only).
 		tf.named_parameters["source"] = duckdb::LogicalType::VARCHAR;
-		loader.RegisterFunction(tf);
+		duckdb::CreateTableFunctionInfo info(tf);
+		// No parameter names here: naming just the path would make
+		// duckdb_functions() label the named parameters col1..colN instead of
+		// f / ff / range / source.
+		duckdb::FunctionDescription doc;
+		doc.description = description;
+		doc.examples = std::move(examples);
+		info.descriptions.push_back(std::move(doc));
+		loader.RegisterFunction(std::move(info));
 	};
-	registerGor("read_gor", duckdb::ReadGorBind);
-	registerGor("read_gorz", duckdb::ReadGorzBind);
-	registerGor("read_gord", duckdb::ReadGordBind);
+	registerGor("read_gor", duckdb::ReadGorBind,
+	            "Reads a GORpipe .gorz file or .gord dictionary (a dictionary file or a .gord folder) as a table; "
+	            "the kind is taken from the path. Named parameters: range := 'chrN[:start-end]' keeps one genomic "
+	            "range (GOR's -p); for a .gord, f := ['tag', ...] and ff := 'tag-file' keep only the partitions with "
+	            "those tags (GOR's -f / -ff) and source := 'name' renames the Source column.",
+	            {"SELECT * FROM read_gor('variants.gorz', range := 'chr1:1500-2500')",
+	             "SELECT * FROM read_gor('cohort.gord', f := ['sample1', 'sample99'])"});
+	registerGor("read_gorz", duckdb::ReadGorzBind,
+	            "Reads a GORpipe .gorz file as a table, whatever the path's extension. chrom / pos predicates in the "
+	            "WHERE clause seek to the matching blocks; range := 'chrN[:start-end]' keeps one genomic range "
+	            "(GOR's -p).",
+	            {"SELECT chrom, pos, ref, alt FROM read_gorz('variants.gorz') WHERE chrom = 'chr1' AND pos BETWEEN "
+	             "1500 AND 2500",
+	             "SELECT count(*) FROM read_gorz('variants.gorz', range := 'chr7')"});
+	registerGor("read_gord", duckdb::ReadGordBind,
+	            "Reads a GORpipe .gord dictionary (a dictionary file or a .gord folder) as one table, with a trailing "
+	            "Source column holding each row's partition tag. Named parameters: f := ['tag', ...] and ff := "
+	            "'tag-file' keep only the partitions with those tags (GOR's -f / -ff), source := 'name' renames the "
+	            "Source column, range := 'chrN[:start-end]' keeps one genomic range (GOR's -p).",
+	            {"SELECT * FROM read_gord('cohort.gord', f := ['sample1', 'sample99'])",
+	             "SELECT count(*) FROM read_gord('cohort.gord', ff := 'tags.txt', range := 'chr7')"});
 
 	// COPY (SELECT ... ORDER BY chrom, pos) TO 'x.gorz' (FORMAT gorz)
 	//   and the plain-text FORMAT gor. Registering `extension` also makes the
