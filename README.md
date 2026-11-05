@@ -35,7 +35,7 @@ COPY (SELECT chrom, pos, ref, alt FROM my_variants)
 - **Partition filters** — GOR's `-f` / `-ff` semantics prune a `.gord`'s file list and expose a `Source` column: `f := ['A','B']` is an inline tag list, `ff := 'tags.txt'` is a *tag file* (one tag per line / first tab-delimited column, `#` lines skipped). `source := 'PN'` renames the exposed column.
 - **`COPY … TO 'x.gorz' (FORMAT gorz)`** and `(FORMAT gor)` — single-threaded, block-zip; validates GOR order (chromosomes ascend lexicographically, positions non-decreasing). `META` also writes the `.gorz.meta` sidecar (columns, types, line count, range, MD5), which `read_gor` uses to hand the column types back.
 - **`COPY … TO 'x.gord' (FORMAT gord)`** — writes a dictionary *folder*, as `pgor … | write x.gord` does: one `.gorz` + `.gorz.meta` per genomic range and `x.gord/thedict.gord`. See [Writing a `.gord` folder](#writing-a-gord-folder).
-- **Object stores** — paths resolve through DuckDB's FileSystem, so `s3://…` works when `httpfs` is loaded.
+- **Object stores** — reads and writes resolve through DuckDB's FileSystem, so `s3://…` (S3, MinIO, R2, GCS) works for `.gorz` files and `.gord` folders alike once `httpfs` is loaded and a secret is set up.
 
 Files written by this extension are read/seeked natively by `gorpipe` itself, and vice-versa.
 
@@ -84,6 +84,19 @@ follows the partition size (set by `SPLIT`) rather than the size of the input. S
 run at once — as many as fit within `memory_limit`, so larger partitions run fewer at a time. The
 staging directory needs room for a Parquet copy of the data and is removed at the end;
 `thedict.gord` is written last, so an interrupted write never leaves a readable dictionary.
+
+### Writing to an object store
+
+```sql
+LOAD httpfs;
+CREATE SECRET (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-west-1');
+COPY (SELECT * FROM variants) TO 's3://bucket/out.gord' (FORMAT gord, SPLIT 100);
+SELECT count(*) FROM 's3://bucket/out.gord' WHERE chrom = 'chr17';
+```
+
+The staging files stay on local disk — in DuckDB's `temp_directory` unless `STAGING` names another
+local directory — and only the finished `.gorz`, `.meta` and `thedict.gord` objects are uploaded,
+the dictionary last. `OVERWRITE` deletes the objects of the folder being replaced.
 
 ## Building locally
 

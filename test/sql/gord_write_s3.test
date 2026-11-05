@@ -1,0 +1,148 @@
+# name: test/sql/gord_write_s3.test
+# description: write .gorz files and .gord folders to an S3-compatible object store and read them back (needs a running store, e.g. MinIO — see test/README.md)
+# group: [sql]
+
+require gorz
+
+require parquet
+
+# Skipped unless an object store is configured for the run.
+require-env GORZ_S3_TEST_URL
+
+require-env GORZ_S3_ENDPOINT
+
+require-env AWS_ACCESS_KEY_ID
+
+require-env AWS_SECRET_ACCESS_KEY
+
+statement ok
+LOAD httpfs;
+
+statement ok
+CREATE SECRET gorz_s3_test (TYPE s3, KEY_ID '${AWS_ACCESS_KEY_ID}', SECRET '${AWS_SECRET_ACCESS_KEY}',
+                            ENDPOINT '${GORZ_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');
+
+statement ok
+CREATE TABLE v AS SELECT * FROM (VALUES
+    ('chr2', 7, 'T', 0.5), ('chr1', 5000, 'A', 0.25), ('chr10', 3, 'G', NULL),
+    ('chr1', 10, 'C', 1.0), ('chr1', 2000, 'A', 0.125), ('chr1', 1999, 'G', 2.0))
+    t(chrom, pos, ref, af);
+
+# --- a single .gorz (+ .meta): a second, shorter write replaces the object ---
+statement ok
+COPY (SELECT * FROM v ORDER BY chrom, pos) TO '${GORZ_S3_TEST_URL}/one.gorz' (FORMAT gorz, META);
+
+statement ok
+COPY (SELECT * FROM v WHERE chrom = 'chr2') TO '${GORZ_S3_TEST_URL}/one.gorz' (FORMAT gorz, META);
+
+query TIR
+SELECT chrom, pos, af FROM '${GORZ_S3_TEST_URL}/one.gorz';
+----
+chr2	7	0.5
+
+# --- a .gord folder: unsorted input, staged locally, written to the store ----
+query I
+COPY v TO '${GORZ_S3_TEST_URL}/w.gord' (FORMAT gord, OVERWRITE);
+----
+6
+
+# Read back by folder URL; entries resolve relative to the dictionary's URL.
+query TITRT
+SELECT * FROM '${GORZ_S3_TEST_URL}/w.gord';
+----
+chr1	10	C	1.0	1
+chr1	1999	G	2.0	1
+chr1	2000	A	0.125	1
+chr1	5000	A	0.25	1
+chr10	3	G	NULL	2
+chr2	7	T	0.5	3
+
+query T
+SELECT parse_filename(file) FROM glob('${GORZ_S3_TEST_URL}/w.gord/**') ORDER BY 1;
+----
+chr1.gorz
+chr1.gorz.meta
+chr10.gorz
+chr10.gorz.meta
+chr2.gorz
+chr2.gorz.meta
+thedict.gord
+
+# An existing folder is an error without OVERWRITE...
+statement error
+COPY v TO '${GORZ_S3_TEST_URL}/w.gord';
+----
+already exists and is not empty
+
+# ...and OVERWRITE removes the old objects rather than leaving them orphaned.
+statement ok
+COPY (SELECT * FROM v WHERE chrom = 'chr1') TO '${GORZ_S3_TEST_URL}/w.gord' (OVERWRITE, SPLIT 2000);
+
+query T
+SELECT parse_filename(file) FROM glob('${GORZ_S3_TEST_URL}/w.gord/**') ORDER BY 1;
+----
+chr1_0_1999.gorz
+chr1_0_1999.gorz.meta
+chr1_2000_3999.gorz
+chr1_2000_3999.gorz.meta
+chr1_4000_5999.gorz
+chr1_4000_5999.gorz.meta
+thedict.gord
+
+query I
+SELECT count(*) FROM '${GORZ_S3_TEST_URL}/w.gord';
+----
+4
+
+# A prefix holding anything that is not part of a .gord folder is never deleted.
+statement ok
+COPY (SELECT 1 AS a) TO '${GORZ_S3_TEST_URL}/f.gord/notes.txt' (FORMAT csv);
+
+statement error
+COPY v TO '${GORZ_S3_TEST_URL}/f.gord' (OVERWRITE);
+----
+refusing to OVERWRITE
+
+# A failing query leaves no objects behind.
+statement error
+COPY (SELECT 'chr1' AS chrom, i::INT AS pos, CASE WHEN i = 5000 THEN error('boom') END AS e FROM range(10000) t(i))
+  TO '${GORZ_S3_TEST_URL}/x.gord';
+----
+boom
+
+query I
+SELECT count(*) FROM glob('${GORZ_S3_TEST_URL}/x.gord/**');
+----
+0
+
+# Staging is always local.
+statement error
+COPY v TO '${GORZ_S3_TEST_URL}/y.gord' (STAGING '${GORZ_S3_TEST_URL}/stage');
+----
+STAGING must be a local directory
+
+# --- a larger unsorted input from a TEMP table round-trips exactly -----------
+statement ok
+CREATE TEMP TABLE big AS
+SELECT 'chr' || (1 + (i % 5))::VARCHAR AS chrom, (hash(i) % 1000000)::INTEGER AS pos, md5(i::VARCHAR) AS info
+FROM range(50000) t(i);
+
+query I
+COPY big TO '${GORZ_S3_TEST_URL}/big.gord' (OVERWRITE, SPLIT 100000);
+----
+50000
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM big EXCEPT ALL SELECT * EXCLUDE (Source) FROM '${GORZ_S3_TEST_URL}/big.gord')
+    UNION ALL
+    (SELECT * EXCLUDE (Source) FROM '${GORZ_S3_TEST_URL}/big.gord' EXCEPT ALL SELECT * FROM big));
+----
+0
+
+# Range pushdown seeks within the remote files.
+query I
+SELECT count(*) = (SELECT count(*) FROM big WHERE chrom = 'chr3' AND pos BETWEEN 250000 AND 350000)
+FROM '${GORZ_S3_TEST_URL}/big.gord' WHERE chrom = 'chr3' AND pos BETWEEN 250000 AND 350000;
+----
+true

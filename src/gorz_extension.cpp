@@ -1449,10 +1449,16 @@ char gorSchemaLetter(const LogicalType &type) {
 	}
 }
 
+// Open `path` for writing, replacing whatever is there. FILE_CREATE_NEW rather
+// than FILE_CREATE + Truncate(0): an object store has no file to truncate (a
+// write is a fresh upload that replaces the object) and rejects the call.
+unique_ptr<FileHandle> openForWrite(FileSystem &fs, const std::string &path) {
+	return fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW);
+}
+
 // Create/overwrite `path` with `text` through DuckDB's FileSystem.
 void writeTextFile(FileSystem &fs, const std::string &path, const std::string &text) {
-	auto handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
-	handle->Truncate(0);
+	auto handle = openForWrite(fs, path);
 	handle->Write(const_cast<char *>(text.data()), static_cast<idx_t>(text.size()));
 	handle->Close();
 }
@@ -1502,14 +1508,13 @@ unique_ptr<GlobalFunctionData> GorCopyInitGlobal(ClientContext &context, Functio
 	auto &fs = FileSystem::GetFileSystem(context);
 	unique_ptr<FileHandle> handle;
 	try {
-		handle = fs.OpenFile(file_path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
+		handle = openForWrite(fs, file_path); // overwrite semantics — no trailing bytes from a prior file
 	} catch (const std::exception &e) {
 		throw IOException("COPY to gor: cannot open " + file_path + " for writing: " + e.what());
 	}
 	if (!handle) {
 		throw IOException("COPY to gor: cannot open " + file_path + " for writing");
 	}
-	handle->Truncate(0); // overwrite semantics — no trailing bytes from a prior file
 
 	auto gs = make_uniq<GorCopyGlobalState>();
 	gs->path = file_path;
@@ -1693,6 +1698,9 @@ CopyFunctionExecutionMode GorCopyExecMode(bool /*preserve_insertion_order*/, boo
 //      assembled from the .meta sidecars (as GOR's writeDictionaryFromMeta
 //      does) and written LAST: a folder without thedict.gord is not a result.
 //
+// The target may be an object store (s3://…): staging then stays on local disk
+// (temp_directory, or STAGING) and only the finished objects are uploaded.
+//
 // SPLIT follows `pgor -split`: 'chrom' (default) is one file per chromosome;
 // n <= 1000 is n genome partitions (a step of 3e9/n bases within each
 // chromosome); n > 1000 is the step in bases. A file never spans chromosomes,
@@ -1716,7 +1724,7 @@ struct GordWriteSpec {
 	std::string stagingDir; // partitioned parquet lives here until stage 2 is done
 	int64_t step = 0;       // bases per file; 0 → one file per chromosome
 	bool overwrite = false;
-	bool remote = false;        // object store: no directories to create or probe
+	bool remote = false;        // object store: a key prefix, not a directory
 	vector<string> columnNames; // the query's columns → ## COLUMNS
 };
 
@@ -1738,42 +1746,66 @@ bool isGordFolderFile(const std::string &name) {
 	return false;
 }
 
-// Check the COPY target before any work is done (and again right before it is
-// replaced). Returns true when something is there that OVERWRITE must remove.
-bool checkGordTarget(FileSystem &fs, const GordWriteSpec &spec) {
-	if (spec.remote) {
-		return false;
+// What the COPY target currently holds, for a local directory and an
+// object-store prefix alike (a store has no directories: the "folder" is every
+// object under <outDir>/).
+struct GordTarget {
+	bool isFile = false;    // a plain file / object sits at the path itself
+	vector<string> entries; // names under the folder, relative to it
+	std::string foreign;    // first entry that is not part of a .gord folder
+};
+
+GordTarget inspectGordTarget(FileSystem &fs, const GordWriteSpec &spec) {
+	GordTarget target;
+	target.isFile = fs.FileExists(spec.outDir);
+	if (target.isFile) {
+		return target;
 	}
-	if (fs.FileExists(spec.outDir)) {
+	auto add = [&](const std::string &name, bool nested) {
+		target.entries.push_back(name);
+		if (target.foreign.empty() && (nested || !isGordFolderFile(name))) {
+			target.foreign = name;
+		}
+	};
+	if (spec.remote) {
+		const std::string prefix = spec.outDir + "/";
+		for (auto &object : fs.Glob(prefix + "**")) {
+			if (!StringUtil::StartsWith(object.path, prefix)) {
+				continue;
+			}
+			const std::string name = object.path.substr(prefix.size());
+			add(name, name.find('/') != std::string::npos);
+		}
+	} else if (fs.DirectoryExists(spec.outDir)) {
+		fs.ListFiles(spec.outDir, [&](const string &name, bool isDir) { add(name, isDir); });
+	}
+	return target;
+}
+
+// Check the COPY target before any work is done (and again right before it is
+// replaced). Returns what is there; throws unless it is empty or OVERWRITE may
+// remove it.
+GordTarget checkGordTarget(FileSystem &fs, const GordWriteSpec &spec) {
+	auto target = inspectGordTarget(fs, spec);
+	if (target.isFile) {
 		if (!spec.overwrite) {
 			throw IOException("gord COPY: \"%s\" already exists (use OVERWRITE to replace it)", spec.outDir);
 		}
-		return true;
+		return target;
 	}
-	if (!fs.DirectoryExists(spec.outDir)) {
-		return false;
-	}
-	bool empty = true;
-	std::string foreign;
-	fs.ListFiles(spec.outDir, [&](const string &name, bool isDir) {
-		empty = false;
-		if (foreign.empty() && (isDir || !isGordFolderFile(name))) {
-			foreign = name;
-		}
-	});
-	if (empty) {
-		return false;
+	if (target.entries.empty()) {
+		return target;
 	}
 	if (!spec.overwrite) {
-		throw IOException("gord COPY: directory \"%s\" already exists and is not empty (use OVERWRITE to replace it)",
+		throw IOException("gord COPY: \"%s\" already exists and is not empty (use OVERWRITE to replace it)",
 		                  spec.outDir);
 	}
-	if (!foreign.empty()) {
+	if (!target.foreign.empty()) {
 		throw IOException("gord COPY: refusing to OVERWRITE \"%s\": it holds \"%s\", which is not part of a .gord "
 		                  "folder",
-		                  spec.outDir, foreign);
+		                  spec.outDir, target.foreign);
 	}
-	return true;
+	return target;
 }
 
 // One staged partition = one output .gorz.
@@ -1849,13 +1881,18 @@ idx_t writeGordFolder(ClientContext &context, const GordWriteSpec &spec) {
 	auto parts = listGordPartitions(fs, spec);
 
 	// Replace the target only now that the whole input is safely staged.
-	if (checkGordTarget(fs, spec)) {
-		if (fs.FileExists(spec.outDir)) {
-			fs.RemoveFile(spec.outDir);
-		} else {
-			fs.RemoveDirectory(spec.outDir);
+	const auto existing = checkGordTarget(fs, spec);
+	if (existing.isFile) {
+		fs.RemoveFile(spec.outDir);
+	} else if (spec.remote) {
+		for (auto &name : existing.entries) {
+			fs.RemoveFile(fs.JoinPath(spec.outDir, name));
 		}
+	} else if (!existing.entries.empty()) {
+		fs.RemoveDirectory(spec.outDir);
 	}
+	// A local folder we create is ours to remove again on failure; an object
+	// store has no directory to create, only the objects written below.
 	bool createdDir = false;
 	if (!spec.remote && !fs.DirectoryExists(spec.outDir)) {
 		fs.CreateDirectory(spec.outDir);
@@ -2153,6 +2190,9 @@ BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
 		spec.outDir.pop_back();
 	}
 	spec.remote = FileSystem::IsRemoteFile(spec.outDir);
+	if (spec.remote && spec.outDir.find("://") == std::string::npos) {
+		throw BinderException("gord COPY: unsupported target \"%s\"", spec.outDir);
+	}
 	std::string stagingParent;
 	for (auto &opt : info.options) {
 		const auto name = StringUtil::Lower(opt.first);
@@ -2204,6 +2244,9 @@ BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
 			}
 			fs.CreateDirectoriesRecursive(stagingParent);
 		}
+	}
+	if (FileSystem::IsRemoteFile(stagingParent)) {
+		throw BinderException("gord COPY: STAGING must be a local directory, got \"%s\"", stagingParent);
 	}
 	if (!fs.DirectoryExists(stagingParent)) {
 		throw IOException("gord COPY: directory \"%s\" does not exist", stagingParent);
