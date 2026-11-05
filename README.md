@@ -18,6 +18,10 @@ SELECT count(*) FROM 'variants.gord';
 -- write a query result back out as .gorz (GOR order required)
 COPY (SELECT chrom, pos, ref, alt FROM my_variants ORDER BY chrom, pos)
   TO 'out.gorz' (FORMAT gorz);
+
+-- write a .gord dictionary folder: one sorted .gorz per genomic range (any input order)
+COPY (SELECT chrom, pos, ref, alt FROM my_variants)
+  TO 'out.gord' (FORMAT gord, SPLIT 100);
 ```
 
 ## Features
@@ -29,7 +33,8 @@ COPY (SELECT chrom, pos, ref, alt FROM my_variants ORDER BY chrom, pos)
 - **Projection & parallel scan** — only selected columns are read; large files scan across threads.
 - **`WHERE chrom/pos` → block seek** — range predicates seek into the right block instead of scanning the whole file.
 - **Partition filters** — GOR's `-f` / `-ff` semantics prune a `.gord`'s file list and expose a `Source` column: `f := ['A','B']` is an inline tag list, `ff := 'tags.txt'` is a *tag file* (one tag per line / first tab-delimited column, `#` lines skipped). `source := 'PN'` renames the exposed column.
-- **`COPY … TO 'x.gorz' (FORMAT gorz)`** and `(FORMAT gor)` — single-threaded, block-zip; validates GOR order (chromosomes ascend lexicographically, positions non-decreasing).
+- **`COPY … TO 'x.gorz' (FORMAT gorz)`** and `(FORMAT gor)` — single-threaded, block-zip; validates GOR order (chromosomes ascend lexicographically, positions non-decreasing). `META` also writes the `.gorz.meta` sidecar (columns, types, line count, range, MD5), which `read_gor` uses to hand the column types back.
+- **`COPY … TO 'x.gord' (FORMAT gord)`** — writes a dictionary *folder*, as `pgor … | write x.gord` does: one `.gorz` + `.gorz.meta` per genomic range and `x.gord/thedict.gord`. See [Writing a `.gord` folder](#writing-a-gord-folder).
 - **Object stores** — paths resolve through DuckDB's FileSystem, so `s3://…` works when `httpfs` is loaded.
 
 Files written by this extension are read/seeked natively by `gorpipe` itself, and vice-versa.
@@ -48,6 +53,37 @@ build and writes only to `/tmp`:
 pip install duckdb jupyterlab pandas
 jupyter lab examples/gorz_community_extension.ipynb
 ```
+
+## Writing a `.gord` folder
+
+```sql
+COPY (SELECT * FROM variants) TO 'out.gord' (FORMAT gord);                  -- one file per chromosome
+COPY (SELECT * FROM variants) TO 'out.gord' (FORMAT gord, SPLIT 100);       -- 100 genome partitions
+COPY (SELECT * FROM variants) TO 'out.gord' (FORMAT gord, SPLIT 10000000);  -- 10 Mb per file
+SELECT count(*) FROM 'out.gord' WHERE chrom = 'chr17';                      -- read it back by folder path
+```
+
+The first two columns must be the chromosome (`VARCHAR`) and the position (an integer). The query
+needs no `ORDER BY`: rows may arrive in any order and each file is sorted as it is written.
+
+| Option | Meaning |
+|---|---|
+| `SPLIT 'chrom'` | One file per chromosome (the default). |
+| `SPLIT n`, `n` ≤ 1000 | `n` genome partitions: a step of 3,000,000,000 / `n` bases within each chromosome (as `pgor -split=n`). |
+| `SPLIT n`, `n` > 1000 | `n` bases per file. |
+| `OVERWRITE` | Replace an existing `.gord` folder. Without it a non-empty target is an error; a directory holding anything that is not part of a `.gord` folder is never deleted. |
+| `STAGING 'dir'` | Where to put the temporary files (default: next to the output). |
+
+A file never spans chromosomes, ranges with no rows produce no file, and at most 5000 files are
+written. The dictionary lists each file with the alias `1..N` and the range of the rows it holds.
+
+How it works: the query runs once, in your connection (temp tables and views work), and is written
+as partitioned Parquet into a staging directory, one partition per range. Each partition is then
+sorted and written as `.gorz` on its own, so no sort ever covers more than one partition and memory
+follows the partition size (set by `SPLIT`) rather than the size of the input. Several partitions
+run at once — as many as fit within `memory_limit`, so larger partitions run fewer at a time. The
+staging directory needs room for a Parquet copy of the data and is removed at the end;
+`thedict.gord` is written last, so an interrupted write never leaves a readable dictionary.
 
 ## Building locally
 
