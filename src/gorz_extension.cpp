@@ -551,38 +551,39 @@ void splitTabs(std::string_view line, std::vector<std::string_view> &out) {
 // the seek hint partial; DuckDB will still produce correct results.
 
 bool tryExtractChromOrPos(const Expression &e, SeekHint &hint, const std::vector<idx_t> &boundIdxToTableCol) {
-	if (e.expression_class != ExpressionClass::BOUND_COMPARISON)
+	// A comparison is a function expression whose expression type is the operator.
+	if (!BoundComparisonExpression::IsComparison(e))
 		return false;
-	auto &cmp = e.Cast<BoundComparisonExpression>();
-	auto cmpType = cmp.type;
+	auto &cmp = e.Cast<BoundFunctionExpression>();
+	auto cmpType = cmp.GetExpressionType();
 
 	// Normalise: column on the left, constant on the right. If reversed,
 	// flip the comparison so we don't have to handle both shapes below.
-	const Expression *colExpr = cmp.left.get();
-	const Expression *constExpr = cmp.right.get();
+	const Expression *colExpr = &BoundComparisonExpression::Left(cmp);
+	const Expression *constExpr = &BoundComparisonExpression::Right(cmp);
 	bool flipped = false;
-	if (colExpr->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
-	    constExpr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+	if (colExpr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
+	    constExpr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		std::swap(colExpr, constExpr);
 		flipped = true;
 	}
-	if (colExpr->expression_class != ExpressionClass::BOUND_COLUMN_REF)
+	if (colExpr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF)
 		return false;
-	if (constExpr->expression_class != ExpressionClass::BOUND_CONSTANT)
+	if (constExpr->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT)
 		return false;
 
 	auto &colRef = colExpr->Cast<BoundColumnRefExpression>();
-	auto &constRef = constExpr->Cast<BoundConstantExpression>();
+	const Value &constant = constExpr->Cast<BoundConstantExpression>().GetValue();
 	// BoundColumnRef.binding.column_index is the POST-projection slot, not
 	// the original table column. Translate via column_ids — without this,
 	// `WHERE ref = 'G'` on a query that only references ref looks like
 	// column_index == 0 (= chrom by gor convention), and we'd mistakenly
 	// stash 'G' as the chrom hint.
-	const idx_t boundIdx = colRef.binding.column_index;
+	const idx_t boundIdx = colRef.Binding().column_index;
 	if (boundIdx >= boundIdxToTableCol.size())
 		return false;
 	const idx_t col = boundIdxToTableCol[boundIdx];
-	if (constRef.value.IsNull())
+	if (constant.IsNull())
 		return false;
 
 	// Reflect the comparison when we swapped sides: `5 < pos` ≡ `pos > 5`.
@@ -612,7 +613,7 @@ bool tryExtractChromOrPos(const Expression &e, SeekHint &hint, const std::vector
 		if (cmpType != ExpressionType::COMPARE_EQUAL)
 			return false;
 		try {
-			hint.chrom = constRef.value.GetValue<std::string>();
+			hint.chrom = constant.GetValue<std::string>();
 			hint.haveChrom = true;
 			return true;
 		} catch (...) {
@@ -622,7 +623,7 @@ bool tryExtractChromOrPos(const Expression &e, SeekHint &hint, const std::vector
 	if (col == 1) {
 		// pos column: arithmetic comparison.
 		try {
-			int64_t v = constRef.value.GetValue<int64_t>();
+			int64_t v = constant.GetValue<int64_t>();
 			switch (cmpType) {
 			case ExpressionType::COMPARE_EQUAL:
 				hint.posLo = std::max(hint.posLo, v);
@@ -655,33 +656,36 @@ bool tryExtractChromOrPos(const Expression &e, SeekHint &hint, const std::vector
 	return false;
 }
 
-// Extract from a BoundBetweenExpression — DuckDB folds
-// `pos >= A AND pos <= B` (and the SQL BETWEEN form) into this single
-// node before pushdown. We split it into the two implied bounds and
-// reuse the comparison-extractor.
+// Extract from a BETWEEN — DuckDB folds `pos >= A AND pos <= B` (and the
+// SQL BETWEEN form) into this single function expression before pushdown.
+// We split it into the two implied bounds.
 bool tryExtractBetween(const Expression &e, SeekHint &hint, const std::vector<idx_t> &boundIdxToTableCol) {
-	if (e.expression_class != ExpressionClass::BOUND_BETWEEN)
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+	    e.GetExpressionType() != ExpressionType::COMPARE_BETWEEN)
 		return false;
-	auto &bet = e.Cast<BoundBetweenExpression>();
+	auto &bet = e.Cast<BoundFunctionExpression>();
+	// The inclusiveness of each end lives in the function's bind data.
+	if (bet.GetChildren().size() != 3 || !BoundBetweenExpression::HasValidBindData(bet))
+		return false;
 	// input compared against lower/upper. Each end can be inclusive or not.
-	const Expression *colExpr = bet.input.get();
-	if (colExpr->expression_class != ExpressionClass::BOUND_COLUMN_REF)
+	const Expression *colExpr = &BoundBetweenExpression::Input(bet);
+	if (colExpr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF)
 		return false;
 	auto &colRef = colExpr->Cast<BoundColumnRefExpression>();
-	const idx_t boundIdx = colRef.binding.column_index;
+	const idx_t boundIdx = colRef.Binding().column_index;
 	if (boundIdx >= boundIdxToTableCol.size())
 		return false;
 	if (boundIdxToTableCol[boundIdx] != 1)
 		return false; // pos only
 
 	auto extractEnd = [&](const Expression &endExpr, bool inclusive, bool isLower) {
-		if (endExpr.expression_class != ExpressionClass::BOUND_CONSTANT)
+		if (endExpr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT)
 			return;
-		auto &c = endExpr.Cast<BoundConstantExpression>();
-		if (c.value.IsNull())
+		const Value &c = endExpr.Cast<BoundConstantExpression>().GetValue();
+		if (c.IsNull())
 			return;
 		try {
-			int64_t v = c.value.GetValue<int64_t>();
+			int64_t v = c.GetValue<int64_t>();
 			if (isLower) {
 				int64_t lo = inclusive ? v : v + 1;
 				hint.posLo = std::max(hint.posLo, lo);
@@ -694,17 +698,17 @@ bool tryExtractBetween(const Expression &e, SeekHint &hint, const std::vector<id
 		} catch (...) {
 		}
 	};
-	extractEnd(*bet.lower, bet.lower_inclusive, /*isLower=*/true);
-	extractEnd(*bet.upper, bet.upper_inclusive, /*isLower=*/false);
+	extractEnd(BoundBetweenExpression::LowerBound(bet), BoundBetweenExpression::LowerInclusive(bet), /*isLower=*/true);
+	extractEnd(BoundBetweenExpression::UpperBound(bet), BoundBetweenExpression::UpperInclusive(bet), /*isLower=*/false);
 	return true;
 }
 
 void walkForSeekHint(const Expression &e, SeekHint &hint, const std::vector<idx_t> &boundIdxToTableCol) {
-	if (e.expression_class == ExpressionClass::BOUND_CONJUNCTION) {
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
 		auto &conj = e.Cast<BoundConjunctionExpression>();
 		// Only AND lets us combine — OR could admit non-matching rows.
-		if (conj.type == ExpressionType::CONJUNCTION_AND) {
-			for (auto &child : conj.children) {
+		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			for (auto &child : conj.GetChildren()) {
 				walkForSeekHint(*child, hint, boundIdxToTableCol);
 			}
 		}
@@ -877,7 +881,7 @@ SeekHint effectiveSeek(const GorBindData &bind) {
 // read_gor), and discovers columns + types for that kind — filling
 // return_types / names. The kind is carried on the bind data into init/execute.
 unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names,
+                                         vector<LogicalType> &return_types, vector<Identifier> &names,
                                          std::optional<GorKind> forced) {
 	if (input.inputs.empty() || input.inputs[0].type() != LogicalType::VARCHAR) {
 		throw BinderException("read_gor expects a single VARCHAR file path");
@@ -921,7 +925,7 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 	// INTEGER for pos, rest VARCHAR).
 	auto finishColumns = [&](const gorz::GorMeta &meta) {
 		for (std::size_t i = 0; i < data->columnNames.size(); ++i) {
-			names.push_back(data->columnNames[i]);
+			names.push_back(Identifier(data->columnNames[i]));
 			LogicalType t = resolveColumnType(i, data->columnNames, meta.schema);
 			data->columnTypes.push_back(t);
 			return_types.push_back(t);
@@ -980,7 +984,7 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 			sourceCol = "Source";
 		data->columnNames.push_back(sourceCol);
 		data->columnTypes.push_back(LogicalType::VARCHAR);
-		names.push_back(sourceCol);
+		names.push_back(Identifier(sourceCol));
 		return_types.push_back(LogicalType::VARCHAR);
 		return std::move(data);
 	} catch (const std::exception &e) {
@@ -990,15 +994,15 @@ unique_ptr<FunctionData> ReadGorBindImpl(ClientContext &context, TableFunctionBi
 
 // read_gor auto-detects the kind by extension; read_gorz / read_gord force it.
 unique_ptr<FunctionData> ReadGorBind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return ReadGorBindImpl(context, input, return_types, names, std::nullopt);
 }
 unique_ptr<FunctionData> ReadGorzBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return ReadGorBindImpl(context, input, return_types, names, GorKind::GORZ);
 }
 unique_ptr<FunctionData> ReadGordBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return ReadGorBindImpl(context, input, return_types, names, GorKind::GORD);
 }
 
@@ -1140,7 +1144,7 @@ unique_ptr<GlobalTableFunctionState> ReadGorInitGlobal(ClientContext &context, T
 void storeField(DataChunk &output, idx_t col, idx_t row, const LogicalType &type, std::string_view field) {
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR:
-		FlatVector::GetData<string_t>(output.data[col])[row] =
+		FlatVector::GetDataMutable<string_t>(output.data[col])[row] =
 		    StringVector::AddString(output.data[col], field.data(), field.size());
 		break;
 	case LogicalTypeId::INTEGER: {
@@ -1153,7 +1157,7 @@ void storeField(DataChunk &output, idx_t col, idx_t row, const LogicalType &type
 		if (r.ec != std::errc()) {
 			FlatVector::SetNull(output.data[col], row, true);
 		} else {
-			FlatVector::GetData<int32_t>(output.data[col])[row] = v;
+			FlatVector::GetDataMutable<int32_t>(output.data[col])[row] = v;
 		}
 		break;
 	}
@@ -1167,7 +1171,7 @@ void storeField(DataChunk &output, idx_t col, idx_t row, const LogicalType &type
 		if (r.ec != std::errc()) {
 			FlatVector::SetNull(output.data[col], row, true);
 		} else {
-			FlatVector::GetData<int64_t>(output.data[col])[row] = v;
+			FlatVector::GetDataMutable<int64_t>(output.data[col])[row] = v;
 		}
 		break;
 	}
@@ -1182,7 +1186,7 @@ void storeField(DataChunk &output, idx_t col, idx_t row, const LogicalType &type
 		double v = 0;
 		if (TryCast::Operation<string_t, double>(string_t(field.data(), UnsafeNumericCast<uint32_t>(field.size())), v,
 		                                         false)) {
-			FlatVector::GetData<double>(output.data[col])[row] = v;
+			FlatVector::GetDataMutable<double>(output.data[col])[row] = v;
 		} else {
 			FlatVector::SetNull(output.data[col], row, true);
 		}
@@ -1293,7 +1297,7 @@ void ReadGorExecute(ClientContext &, TableFunctionInput &data, DataChunk &output
 				fields.resize(nCols, std::string_view());
 			storeProjected();
 		}
-		output.SetCardinality(row);
+		output.SetChildCardinality(row);
 		return;
 	}
 
@@ -1315,13 +1319,13 @@ void ReadGorExecute(ClientContext &, TableFunctionInput &data, DataChunk &output
 				fields.resize(nCols, std::string_view());
 			storeProjected();
 		}
-		output.SetCardinality(row);
+		output.SetChildCardinality(row);
 		return;
 	}
 
 	// GORZ: single-threaded (global reader) with the range short-circuit.
 	if (g.exhausted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	while (row < capacity) {
@@ -1365,7 +1369,7 @@ void ReadGorExecute(ClientContext &, TableFunctionInput &data, DataChunk &output
 		}
 		storeProjected();
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 // SELECT * FROM 'foo.gorz' → SELECT * FROM read_gorz('foo.gorz').
@@ -1383,7 +1387,7 @@ unique_ptr<TableRef> GorzReplacementScan(ClientContext &, ReplacementScanInput &
 	const char *fn = "read_gor";
 	auto table_ref = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(make_uniq<ConstantExpression>(Value(full)));
+	children.push_back(make_uniq<ConstantExpression>(Literal::String(full)));
 	table_ref->function = make_uniq<FunctionExpression>(fn, std::move(children));
 	return std::move(table_ref);
 }
@@ -1489,7 +1493,7 @@ void writeTextFile(FileSystem &fs, const std::string &path, const std::string &t
 	handle->Close();
 }
 
-unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
+unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<Identifier> &names,
                                      const vector<LogicalType> &sqlTypes, GorWriteFormat fmt) {
 	const char *fmtName = (fmt == GorWriteFormat::GORZ) ? "gorz" : "gor";
 	if (names.size() < 2) {
@@ -1506,10 +1510,12 @@ unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &inp
 	}
 	auto bd = make_uniq<GorCopyBindData>();
 	bd->format = fmt;
-	bd->names = names;
+	for (auto &name : names) {
+		bd->names.push_back(name.GetIdentifierName());
+	}
 	bd->sqlTypes = sqlTypes;
 	for (auto &opt : input.info.options) {
-		if (StringUtil::CIEquals(opt.first, "meta")) {
+		if (StringUtil::CIEquals(opt.first.GetIdentifierName(), "meta")) {
 			if (fmt != GorWriteFormat::GORZ) {
 				throw BinderException("COPY ... TO (FORMAT gor): META is only supported for FORMAT gorz");
 			}
@@ -1519,12 +1525,12 @@ unique_ptr<FunctionData> GorCopyBind(ClientContext &, CopyFunctionBindInput &inp
 	return std::move(bd);
 }
 
-unique_ptr<FunctionData> GorzCopyBind(ClientContext &ctx, CopyFunctionBindInput &in, const vector<string> &names,
+unique_ptr<FunctionData> GorzCopyBind(ClientContext &ctx, CopyFunctionBindInput &in, const vector<Identifier> &names,
                                       const vector<LogicalType> &types) {
 	return GorCopyBind(ctx, in, names, types, GorWriteFormat::GORZ);
 }
-unique_ptr<FunctionData> GorPlainCopyBind(ClientContext &ctx, CopyFunctionBindInput &in, const vector<string> &names,
-                                          const vector<LogicalType> &types) {
+unique_ptr<FunctionData> GorPlainCopyBind(ClientContext &ctx, CopyFunctionBindInput &in,
+                                          const vector<Identifier> &names, const vector<LogicalType> &types) {
 	return GorCopyBind(ctx, in, names, types, GorWriteFormat::GOR);
 }
 
@@ -1581,12 +1587,12 @@ void GorCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	for (idx_t c = 0; c < ncol; ++c) {
 		const LogicalType target = (c == 1) ? LogicalType::BIGINT : LogicalType::VARCHAR;
 		if (input.data[c].GetType() == target) {
-			input.data[c].ToUnifiedFormat(nrow, cols[c]);
+			input.data[c].ToUnifiedFormat(cols[c]);
 			continue;
 		}
 		casts.push_back(make_uniq<Vector>(target));
 		VectorOperations::Cast(context.client, input.data[c], *casts.back(), nrow);
-		casts.back()->ToUnifiedFormat(nrow, cols[c]);
+		casts.back()->ToUnifiedFormat(cols[c]);
 	}
 	const auto chromData = UnifiedVectorFormat::GetData<string_t>(cols[0]);
 	const auto posData = UnifiedVectorFormat::GetData<int64_t>(cols[1]);
@@ -2013,7 +2019,7 @@ idx_t writeGordFolder(ClientContext &context, const GordWriteSpec &spec) {
 	bool interrupted = false;
 	while (running > 0) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
-		if (!interrupted && context.interrupted) {
+		if (!interrupted && context.IsInterrupted()) {
 			interrupted = true;
 			stop = true;
 			admitted.notify_all();
@@ -2162,8 +2168,7 @@ public:
 		return SinkFinalizeType::READY;
 	}
 	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const override {
-		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<GordWriteGlobalState>().rowCount)));
-		chunk.SetCardinality(1);
+		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<GordWriteGlobalState>().rowCount)));
 		return SourceResultType::FINISHED;
 	}
 };
@@ -2221,7 +2226,7 @@ BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
 	}
 	std::string stagingParent;
 	for (auto &opt : info.options) {
-		const auto name = StringUtil::Lower(opt.first);
+		const auto name = StringUtil::Lower(opt.first.GetIdentifierName());
 		if (name == "split") {
 			if (opt.second.size() != 1 || opt.second[0].IsNull()) {
 				throw BinderException("gord COPY: SPLIT takes 'chrom' or a number");
@@ -2287,7 +2292,7 @@ BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
 	                        GORD_BIN_KEY + " FROM (" + info.select_statement->ToString() + ") AS __gord_query) TO " +
 	                        sqlQuote(spec.stagingDir) + " (FORMAT parquet, PARTITION_BY (" + GORD_CHROM_KEY + ", " +
 	                        GORD_BIN_KEY + "), ROW_GROUP_SIZE " + std::to_string(GORD_STAGING_ROW_GROUP) + ")";
-	Parser parser(context.GetParserOptions());
+	Parser parser(context);
 	parser.ParseQuery(sql);
 	auto bound = binder.Bind(*parser.statements[0]);
 	if (bound.plan->type != LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
@@ -2301,13 +2306,15 @@ BoundStatement GordCopyPlan(Binder &binder, CopyStatement &stmt) {
 	}
 	if (staging.expected_types[0].id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("COPY ... TO (FORMAT gord): first column '%s' (chrom) must be VARCHAR, got %s",
-		                      staging.names[0], staging.expected_types[0].ToString());
+		                      staging.names[0].GetIdentifierName(), staging.expected_types[0].ToString());
 	}
 	if (!staging.expected_types[1].IsIntegral()) {
 		throw BinderException("COPY ... TO (FORMAT gord): second column '%s' (pos) must be an integer type, got %s",
-		                      staging.names[1], staging.expected_types[1].ToString());
+		                      staging.names[1].GetIdentifierName(), staging.expected_types[1].ToString());
 	}
-	spec.columnNames.assign(staging.names.begin(), staging.names.begin() + NumericCast<int64_t>(nCols));
+	for (idx_t i = 0; i < nCols; ++i) {
+		spec.columnNames.push_back(staging.names[i].GetIdentifierName());
+	}
 
 	auto write = make_uniq<LogicalGordWrite>(std::move(spec));
 	write->children.push_back(std::move(bound.plan));
@@ -2347,12 +2354,14 @@ void LoadInternal(ExtensionLoader &loader) {
 		//        query result (DuckDB can't take a subquery arg directly).
 		//   ff : a VARCHAR *path* to a tag file (one tag per line / first
 		//        tab-delimited column, '#' lines skipped) — GOR's "file filter".
-		tf.named_parameters["f"] = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
-		tf.named_parameters["ff"] = duckdb::LogicalType::VARCHAR;
-		// GOR -p style hard range: range := 'chrN' | 'chrN:start-end'.
-		tf.named_parameters["range"] = duckdb::LogicalType::VARCHAR;
-		// GOR -s: rename the exposed source column (GORD only).
-		tf.named_parameters["source"] = duckdb::LogicalType::VARCHAR;
+		// range  : GOR -p style hard range, 'chrN' | 'chrN:start-end'.
+		// source : GOR -s, rename the exposed source column (GORD only).
+		tf.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+			options.Add("f", duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR))
+			    .Add("ff", duckdb::LogicalType::VARCHAR)
+			    .Add("range", duckdb::LogicalType::VARCHAR)
+			    .Add("source", duckdb::LogicalType::VARCHAR);
+		});
 		duckdb::CreateTableFunctionInfo info(tf);
 		// No parameter names here: naming just the path would make
 		// duckdb_functions() label the named parameters col1..colN instead of

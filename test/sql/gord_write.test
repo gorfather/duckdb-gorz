@@ -16,14 +16,14 @@ CREATE TABLE v AS SELECT * FROM (VALUES
 
 # --- default: one file per chromosome, no ORDER BY needed --------------------
 query I
-COPY (SELECT * FROM v) TO '__TEST_DIR__/w.gord' (FORMAT gord);
+COPY (SELECT * FROM v) TO '{TEST_DIR}/w.gord' (FORMAT gord);
 ----
 6
 
 # Reads back by folder path in GOR order (chr1 < chr10 < chr2); Source is the
 # dictionary alias 1..N, as in a pgor-written folder.
 query TITRT
-SELECT * FROM '__TEST_DIR__/w.gord';
+SELECT * FROM '{TEST_DIR}/w.gord';
 ----
 chr1	10	C	1.0	1
 chr1	1999	G	2.0	1
@@ -34,7 +34,7 @@ chr2	7	T	0.5	3
 
 # The .meta sidecars carry the SQL types back (pos INTEGER, af DOUBLE).
 query TT
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM '__TEST_DIR__/w.gord');
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM '{TEST_DIR}/w.gord');
 ----
 chrom	VARCHAR
 pos	INTEGER
@@ -45,7 +45,7 @@ Source	VARCHAR
 # The dictionary: GOR's folder header, relative file names, alias 1..N and the
 # range of the rows actually written (tabs shown as '|'; note the trailing one).
 query T
-SELECT replace(unnest(string_split(rtrim(content, E'\n'), E'\n')), E'\t', '|') FROM read_text('__TEST_DIR__/w.gord/thedict.gord');
+SELECT replace(unnest(string_split(rtrim(content, E'\n'), E'\n')), E'\t', '|') FROM read_text('{TEST_DIR}/w.gord/thedict.gord');
 ----
 ## SERIAL = 0
 ## LINE_FILTER = false
@@ -57,7 +57,7 @@ chr2.gorz|3|chr2|7|chr2|7|
 
 # Each file has its own .meta; nothing else is left in the folder.
 query T
-SELECT parse_filename(file) FROM glob('__TEST_DIR__/w.gord/*') ORDER BY 1;
+SELECT parse_filename(file) FROM glob('{TEST_DIR}/w.gord/*') ORDER BY 1;
 ----
 chr1.gorz
 chr1.gorz.meta
@@ -70,13 +70,13 @@ thedict.gord
 # --- SPLIT n > 1000: bases per file, 0-based ranges like pgor ----------------
 # Bare table form + format inferred from the .gord suffix.
 query I
-COPY v TO '__TEST_DIR__/s.gord' (SPLIT 2000);
+COPY v TO '{TEST_DIR}/s.gord' (SPLIT 2000);
 ----
 6
 
 query TTTT
 SELECT column0, column1, column3, column5
-FROM read_csv('__TEST_DIR__/s.gord/thedict.gord', delim = E'\t', header = false, skip = 4, all_varchar = true);
+FROM read_csv('{TEST_DIR}/s.gord/thedict.gord', delim = E'\t', header = false, skip = 4, all_varchar = true);
 ----
 chr1_0_1999.gorz	1	10	1999
 chr1_2000_3999.gorz	2	2000	2000
@@ -85,17 +85,17 @@ chr10_0_1999.gorz	4	3	3
 chr2_0_1999.gorz	5	7	7
 
 query TI
-SELECT chrom, pos FROM '__TEST_DIR__/s.gord' WHERE chrom = 'chr1' AND pos BETWEEN 1999 AND 2000;
+SELECT chrom, pos FROM '{TEST_DIR}/s.gord' WHERE chrom = 'chr1' AND pos BETWEEN 1999 AND 2000;
 ----
 chr1	1999
 chr1	2000
 
 # --- SPLIT n <= 1000: n genome partitions = a step of 3e9/n bases ------------
 statement ok
-COPY v TO '__TEST_DIR__/n.gord' (FORMAT gord, SPLIT 3);
+COPY v TO '{TEST_DIR}/n.gord' (FORMAT gord, SPLIT 3);
 
 query T
-SELECT column0 FROM read_csv('__TEST_DIR__/n.gord/thedict.gord', delim = E'\t', header = false, skip = 4, all_varchar = true);
+SELECT column0 FROM read_csv('{TEST_DIR}/n.gord/thedict.gord', delim = E'\t', header = false, skip = 4, all_varchar = true);
 ----
 chr1_0_999999999.gorz
 chr10_0_999999999.gorz
@@ -106,12 +106,12 @@ statement ok
 CREATE TEMP TABLE keep AS SELECT * FROM v WHERE chrom <> 'chr10';
 
 query I
-COPY (SELECT chrom, pos, ref FROM keep) TO '__TEST_DIR__/t.gord';
+COPY (SELECT chrom, pos, ref FROM keep) TO '{TEST_DIR}/t.gord';
 ----
 5
 
 query I
-SELECT count(*) FROM '__TEST_DIR__/t.gord';
+SELECT count(*) FROM '{TEST_DIR}/t.gord';
 ----
 5
 
@@ -122,15 +122,15 @@ SELECT 'chr' || (1 + (i % 5))::VARCHAR AS chrom, (hash(i) % 1000000)::INTEGER AS
 FROM range(50000) t(i);
 
 query I
-COPY big TO '__TEST_DIR__/big.gord' (SPLIT 100000);
+COPY big TO '{TEST_DIR}/big.gord' (SPLIT 100000);
 ----
 50000
 
 query I
 SELECT count(*) FROM (
-    (SELECT * FROM big EXCEPT ALL SELECT * EXCLUDE (Source) FROM '__TEST_DIR__/big.gord')
+    (SELECT * FROM big EXCEPT ALL SELECT * EXCLUDE (Source) FROM '{TEST_DIR}/big.gord')
     UNION ALL
-    (SELECT * EXCLUDE (Source) FROM '__TEST_DIR__/big.gord' EXCEPT ALL SELECT * FROM big));
+    (SELECT * EXCLUDE (Source) FROM '{TEST_DIR}/big.gord' EXCEPT ALL SELECT * FROM big));
 ----
 0
 
@@ -138,23 +138,23 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
     SELECT pos, lag(pos) OVER (PARTITION BY chrom ORDER BY Source::INT, rn) AS prev
-    FROM (SELECT *, row_number() OVER () AS rn FROM read_gord('__TEST_DIR__/big.gord/thedict.gord')))
+    FROM (SELECT *, row_number() OVER () AS rn FROM read_gord('{TEST_DIR}/big.gord/thedict.gord')))
 WHERE prev > pos;
 ----
 0
 
 # --- existing targets --------------------------------------------------------
 statement error
-COPY v TO '__TEST_DIR__/w.gord';
+COPY v TO '{TEST_DIR}/w.gord';
 ----
 already exists and is not empty
 
 # OVERWRITE replaces the folder (old files are gone, not mixed in).
 statement ok
-COPY (SELECT * FROM v WHERE chrom = 'chr2') TO '__TEST_DIR__/s.gord' (OVERWRITE, SPLIT 'chrom');
+COPY (SELECT * FROM v WHERE chrom = 'chr2') TO '{TEST_DIR}/s.gord' (OVERWRITE, SPLIT 'chrom');
 
 query T
-SELECT parse_filename(file) FROM glob('__TEST_DIR__/s.gord/*') ORDER BY 1;
+SELECT parse_filename(file) FROM glob('{TEST_DIR}/s.gord/*') ORDER BY 1;
 ----
 chr2.gorz
 chr2.gorz.meta
@@ -162,21 +162,21 @@ thedict.gord
 
 # ...but refuses a directory holding anything that is not part of a .gord folder.
 statement ok
-COPY (SELECT 1 AS a) TO '__TEST_DIR__/w.gord/notes.txt' (FORMAT csv);
+COPY (SELECT 1 AS a) TO '{TEST_DIR}/w.gord/notes.txt' (FORMAT csv);
 
 statement error
-COPY v TO '__TEST_DIR__/w.gord' (OVERWRITE);
+COPY v TO '{TEST_DIR}/w.gord' (OVERWRITE);
 ----
 refusing to OVERWRITE
 
 # --- an empty result still leaves a (header-only) dictionary -----------------
 query I
-COPY (SELECT * FROM v WHERE false) TO '__TEST_DIR__/e.gord';
+COPY (SELECT * FROM v WHERE false) TO '{TEST_DIR}/e.gord';
 ----
 0
 
 query T
-SELECT replace(unnest(string_split(rtrim(content, E'\n'), E'\n')), E'\t', '|') FROM read_text('__TEST_DIR__/e.gord/thedict.gord');
+SELECT replace(unnest(string_split(rtrim(content, E'\n'), E'\n')), E'\t', '|') FROM read_text('{TEST_DIR}/e.gord/thedict.gord');
 ----
 ## SERIAL = 0
 ## LINE_FILTER = false
@@ -185,32 +185,32 @@ SELECT replace(unnest(string_split(rtrim(content, E'\n'), E'\n')), E'\t', '|') F
 
 # --- input validation --------------------------------------------------------
 statement error
-COPY (SELECT pos, chrom FROM v) TO '__TEST_DIR__/x.gord';
+COPY (SELECT pos, chrom FROM v) TO '{TEST_DIR}/x.gord';
 ----
 must be VARCHAR
 
 statement error
-COPY (SELECT chrom, af FROM v) TO '__TEST_DIR__/x.gord';
+COPY (SELECT chrom, af FROM v) TO '{TEST_DIR}/x.gord';
 ----
 must be an integer type
 
 statement error
-COPY v TO '__TEST_DIR__/x.gord' (SPLIT 'nope');
+COPY v TO '{TEST_DIR}/x.gord' (SPLIT 'nope');
 ----
 SPLIT takes 'chrom' or a number
 
 statement error
-COPY v TO '__TEST_DIR__/x.gord' (COMPRESSION zstd);
+COPY v TO '{TEST_DIR}/x.gord' (COMPRESSION zstd);
 ----
 unknown option
 
 statement error
-COPY (SELECT NULL::VARCHAR AS chrom, 1 AS pos) TO '__TEST_DIR__/x.gord';
+COPY (SELECT NULL::VARCHAR AS chrom, 1 AS pos) TO '{TEST_DIR}/x.gord';
 ----
 must not be NULL
 
 statement error
-COPY (SELECT '' AS chrom, 1 AS pos) TO '__TEST_DIR__/x.gord';
+COPY (SELECT '' AS chrom, 1 AS pos) TO '{TEST_DIR}/x.gord';
 ----
 must not be empty
 
@@ -218,10 +218,10 @@ must not be empty
 # is sanitised (and kept unique), the dictionary carries the real name.
 statement ok
 COPY (SELECT * FROM (VALUES ('HLA-A*01:01', 5), ('chr 1/x=y', 9), ('chr 1/x=y', 2), ('HLA-A:01:01', 1)) t(chrom, pos))
-  TO '__TEST_DIR__/odd.gord';
+  TO '{TEST_DIR}/odd.gord';
 
 query TI
-SELECT chrom, pos FROM '__TEST_DIR__/odd.gord';
+SELECT chrom, pos FROM '{TEST_DIR}/odd.gord';
 ----
 HLA-A*01:01	5
 HLA-A:01:01	1
@@ -229,7 +229,7 @@ chr 1/x=y	2
 chr 1/x=y	9
 
 query T
-SELECT parse_filename(file) FROM glob('__TEST_DIR__/odd.gord/*.gorz') ORDER BY 1;
+SELECT parse_filename(file) FROM glob('{TEST_DIR}/odd.gord/*.gorz') ORDER BY 1;
 ----
 HLA-A_01_01.gorz
 HLA-A_01_01_2.gorz
@@ -237,13 +237,13 @@ chr_1_x_y.gorz
 
 # A prepared COPY can be executed again.
 statement ok
-PREPARE rewrite AS COPY (SELECT * FROM v WHERE pos > $1) TO '__TEST_DIR__/p.gord' (OVERWRITE);
+PREPARE rewrite AS COPY (SELECT * FROM v WHERE pos > $1) TO '{TEST_DIR}/p.gord' (OVERWRITE);
 
 statement ok
 EXECUTE rewrite(1000);
 
 query I
-SELECT count(*) FROM '__TEST_DIR__/p.gord';
+SELECT count(*) FROM '{TEST_DIR}/p.gord';
 ----
 3
 
@@ -251,28 +251,28 @@ statement ok
 EXECUTE rewrite(5);
 
 query I
-SELECT count(*) FROM '__TEST_DIR__/p.gord';
+SELECT count(*) FROM '{TEST_DIR}/p.gord';
 ----
 5
 
 # A query that fails part-way leaves no folder behind.
 statement error
 COPY (SELECT 'chr1' AS chrom, i::INT AS pos, CASE WHEN i = 5000 THEN error('boom') END AS e FROM range(10000) t(i))
-  TO '__TEST_DIR__/x.gord';
+  TO '{TEST_DIR}/x.gord';
 ----
 boom
 
 query I
-SELECT count(*) FROM glob('__TEST_DIR__/x.gord/*');
+SELECT count(*) FROM glob('{TEST_DIR}/x.gord/*');
 ----
 0
 
 # --- FORMAT gorz, META: the sidecar a dictionary line is built from ----------
 statement ok
-COPY (SELECT * FROM v ORDER BY chrom, pos) TO '__TEST_DIR__/m.gorz' (FORMAT gorz, META);
+COPY (SELECT * FROM v ORDER BY chrom, pos) TO '{TEST_DIR}/m.gorz' (FORMAT gorz, META);
 
 query T
-SELECT rtrim(replace(unnest(string_split(rtrim(regexp_replace(content, 'MD5 = [0-9a-f]{32}', 'MD5 = <md5>'), E'\n'), E'\n')), E'\t', '|')) FROM read_text('__TEST_DIR__/m.gorz.meta');
+SELECT rtrim(replace(unnest(string_split(rtrim(regexp_replace(content, 'MD5 = [0-9a-f]{32}', 'MD5 = <md5>'), E'\n'), E'\n')), E'\t', '|')) FROM read_text('{TEST_DIR}/m.gorz.meta');
 ----
 ## SERIAL = 0
 ## COLUMNS = chrom,pos,ref,af
@@ -284,13 +284,13 @@ SELECT rtrim(replace(unnest(string_split(rtrim(regexp_replace(content, 'MD5 = [0
 
 # The MD5 is of the .gorz file's bytes.
 query I
-SELECT count(*) FROM read_text('__TEST_DIR__/m.gorz.meta') m, read_blob('__TEST_DIR__/m.gorz') b
+SELECT count(*) FROM read_text('{TEST_DIR}/m.gorz.meta') m, read_blob('{TEST_DIR}/m.gorz') b
 WHERE contains(m.content, 'MD5 = ' || md5(b.content));
 ----
 1
 
 query TT
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM '__TEST_DIR__/m.gorz');
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM '{TEST_DIR}/m.gorz');
 ----
 chrom	VARCHAR
 pos	INTEGER

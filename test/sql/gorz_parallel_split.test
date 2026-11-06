@@ -16,14 +16,14 @@ require gorz
 statement ok
 COPY (SELECT 'chr' || (i // 2500 + 1) AS chrom, i % 2500 + 1 AS pos, repeat('ACGT', 50) || i AS seq
       FROM range(7500) t(i) ORDER BY chrom, pos)
-  TO '__TEST_DIR__/split.gorz' (FORMAT gorz);
+  TO '{TEST_DIR}/split.gorz' (FORMAT gorz);
 
 # Reference: single-threaded read.
 statement ok
 SET threads = 1;
 
 statement ok
-CREATE TABLE ref AS SELECT * FROM read_gorz('__TEST_DIR__/split.gorz');
+CREATE TABLE ref AS SELECT * FROM read_gorz('{TEST_DIR}/split.gorz');
 
 query I
 SELECT count(*) FROM ref;
@@ -38,15 +38,15 @@ statement ok
 SET gorz_scan_chunk_bytes = 1;
 
 query I
-SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+SELECT count(*) FROM read_gorz('{TEST_DIR}/split.gorz');
 ----
 7500
 
 query I
 SELECT count(*) FROM (
-  (SELECT * FROM read_gorz('__TEST_DIR__/split.gorz') EXCEPT ALL SELECT * FROM ref)
+  (SELECT * FROM read_gorz('{TEST_DIR}/split.gorz') EXCEPT ALL SELECT * FROM ref)
   UNION ALL
-  (SELECT * FROM ref EXCEPT ALL SELECT * FROM read_gorz('__TEST_DIR__/split.gorz')));
+  (SELECT * FROM ref EXCEPT ALL SELECT * FROM read_gorz('{TEST_DIR}/split.gorz')));
 ----
 0
 
@@ -55,7 +55,7 @@ statement ok
 SET gorz_scan_chunk_bytes = 997;
 
 query I
-SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+SELECT count(*) FROM read_gorz('{TEST_DIR}/split.gorz');
 ----
 7500
 
@@ -64,6 +64,6 @@ statement ok
 RESET gorz_scan_chunk_bytes;
 
 query I
-SELECT count(*) FROM read_gorz('__TEST_DIR__/split.gorz');
+SELECT count(*) FROM read_gorz('{TEST_DIR}/split.gorz');
 ----
 7500
