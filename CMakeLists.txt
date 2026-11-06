@@ -16,25 +16,6 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# Building lib/gorz as C++17 (below) alongside DuckDB's C++11 core surfaces a
-# latent DuckDB ODR quirk with GCC: linking DuckDB's own `plan_serializer` tool
-# with this extension present reports a duplicate
-# `duckdb::BufferedFileWriter::DEFAULT_OPEN_FLAGS` (a static constexpr — a
-# strong symbol under C++11). The two definitions are byte-identical, so let the
-# GNU linker keep the first. Applies to every GNU toolchain that hit it — Linux
-# gcc-toolset-14 AND the Windows MinGW (x86_64-w64-mingw32) build; not MSVC,
-# AppleClang, or Emscripten, which link cleanly.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(CMAKE_EXE_LINKER_FLAGS
-      "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-multiple-definition"
-      CACHE STRING "" FORCE)
-endif()
-
-set(CMAKE_CXX_STANDARD
-    "17"
-    CACHE STRING "C++ standard to enforce")
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 # src/include: the extension header. lib/gorz/include: the DuckDB-independent
 # GORZ/GORD codec (Reader/Writer/Gord/Base128/...), vendored from gormore.
 include_directories(src/include lib/gorz/include)
@@ -53,17 +34,6 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
-
-# lib/gorz uses C++17 (std::optional, std::make_unique). DuckDB's extension
-# build injects -std=c++11 into the global flags (its own parquet extension
-# builds c++11 too), which overrides CMAKE_CXX_STANDARD. Append -std=c++17 to
-# our targets specifically — it lands after the c++11 in the compile line, and
-# clang honours the last -std. Only our TUs are affected; the DuckDB ABI
-# boundary uses DuckDB's own types, so the mixed standard is safe.
-target_compile_features(${EXTENSION_NAME} PUBLIC cxx_std_17)
-target_compile_features(${LOADABLE_EXTENSION_NAME} PUBLIC cxx_std_17)
-target_compile_options(${EXTENSION_NAME} PRIVATE -std=c++17)
-target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -std=c++17)
 
 # Reuse DuckDB's bundled, namespaced zstd (duckdb_zstd) for reading zstd-flagged
 # blocks — <zstd.h> in the extension build already resolves to it, so

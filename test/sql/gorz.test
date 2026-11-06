@@ -15,15 +15,15 @@ require gorz
 statement ok
 COPY (SELECT * FROM (VALUES ('chr1', 1, 'A'), ('chr1', 2, 'C'), ('chr10', 3, 'G'), ('chr2', 5, 'T'))
         t(chrom, pos, ref) ORDER BY chrom, pos)
-  TO '__TEST_DIR__/g.gorz' (FORMAT gorz);
+  TO '{TEST_DIR}/g.gorz' (FORMAT gorz);
 
 query I
-SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz');
+SELECT count(*) FROM read_gor('{TEST_DIR}/g.gorz');
 ----
 4
 
 query TTT
-SELECT chrom, CAST(pos AS VARCHAR), ref FROM read_gor('__TEST_DIR__/g.gorz') ORDER BY chrom, pos;
+SELECT chrom, CAST(pos AS VARCHAR), ref FROM read_gor('{TEST_DIR}/g.gorz') ORDER BY chrom, pos;
 ----
 chr1	1	A
 chr1	2	C
@@ -32,78 +32,78 @@ chr2	5	T
 
 # read_gorz forces the GORZ kind.
 query I
-SELECT count(*) FROM read_gorz('__TEST_DIR__/g.gorz');
+SELECT count(*) FROM read_gorz('{TEST_DIR}/g.gorz');
 ----
 4
 
 # Replacement scan: a bare '...gorz' literal resolves to read_gor(...).
 query I
-SELECT count(*) FROM '__TEST_DIR__/g.gorz';
+SELECT count(*) FROM '{TEST_DIR}/g.gorz';
 ----
 4
 
 # range := 'chrN[:a-b]' — GOR -p style hard filter (fixture: chr1:1, chr1:2, chr10:3, chr2:5).
 query I
-SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1');
+SELECT count(*) FROM read_gor('{TEST_DIR}/g.gorz', range := 'chr1');
 ----
 2
 
 query TT
-SELECT chrom, CAST(pos AS VARCHAR) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1:1-1');
+SELECT chrom, CAST(pos AS VARCHAR) FROM read_gor('{TEST_DIR}/g.gorz', range := 'chr1:1-1');
 ----
 chr1	1
 
 query T
-SELECT chrom FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr2');
+SELECT chrom FROM read_gor('{TEST_DIR}/g.gorz', range := 'chr2');
 ----
 chr2
 
 # range intersects with WHERE (both applied).
 query I
-SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1') WHERE pos = 2;
+SELECT count(*) FROM read_gor('{TEST_DIR}/g.gorz', range := 'chr1') WHERE pos = 2;
 ----
 1
 
 # a chromosome absent from the file yields no rows.
 query I
-SELECT count(*) FROM read_gor('__TEST_DIR__/g.gorz', range := 'chrZ');
+SELECT count(*) FROM read_gor('{TEST_DIR}/g.gorz', range := 'chrZ');
 ----
 0
 
 # malformed range spec errors at bind.
 statement error
-SELECT * FROM read_gor('__TEST_DIR__/g.gorz', range := 'chr1:oops');
+SELECT * FROM read_gor('{TEST_DIR}/g.gorz', range := 'chr1:oops');
 ----
 bad position
 
 # --- plain FORMAT gor writes a valid GOR text file ---------------------------
 statement ok
 COPY (SELECT * FROM (VALUES ('chr1', 1, 'A'), ('chr2', 9, 'G')) t(chrom, pos, ref) ORDER BY chrom, pos)
-  TO '__TEST_DIR__/g.gor' (FORMAT gor);
+  TO '{TEST_DIR}/g.gor' (FORMAT gor);
 
 # The header line is the column names, tab-separated (no leading '#').
 query I
-SELECT count(*) FROM read_csv('__TEST_DIR__/g.gor', delim='\t', header=true);
+SELECT count(*) FROM read_csv('{TEST_DIR}/g.gor', delim='\t', header=true);
 ----
 2
 
 # --- order validation: unordered input must error ----------------------------
 statement error
 COPY (SELECT * FROM (VALUES ('chr2', 5, 'T'), ('chr1', 1, 'A')) t(chrom, pos, ref))
-  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+  TO '{TEST_DIR}/bad.gorz' (FORMAT gorz);
 ----
 Wrong chromosome order in gor stream
 
 statement error
 COPY (SELECT * FROM (VALUES ('chr1', 10, 'T'), ('chr1', 2, 'A')) t(chrom, pos, ref))
-  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+  TO '{TEST_DIR}/bad.gorz' (FORMAT gorz);
 ----
 Wrong order in gor stream
 
 # --- bind-time schema errors -------------------------------------------------
 statement error
 COPY (SELECT * FROM (VALUES ('chr1', 'x', 'A')) t(chrom, pos, ref))
-  TO '__TEST_DIR__/bad.gorz' (FORMAT gorz);
+  TO '{TEST_DIR}/bad.gorz' (FORMAT gorz);
 ----
 must be an integer type
 
