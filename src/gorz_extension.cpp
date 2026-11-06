@@ -392,6 +392,15 @@ public:
 	    : handle_(std::move(handle)), md5_(md5) {
 	}
 
+	// Completes the file. An object store only commits the upload on an
+	// explicit Close(); a handle that is merely destroyed leaves no object.
+	void close() {
+		if (handle_) {
+			handle_->Close();
+			handle_.reset();
+		}
+	}
+
 protected:
 	std::streamsize xsputn(const char *s, std::streamsize n) override {
 		if (n > 0) {
@@ -423,6 +432,11 @@ public:
 	explicit FileHandleOutputStream(unique_ptr<FileHandle> handle, MD5Context *md5 = nullptr)
 	    : std::ostream(nullptr), buf_(std::move(handle), md5) {
 		rdbuf(&buf_);
+	}
+
+	void close() {
+		flush();
+		buf_.close();
 	}
 
 private:
@@ -1420,9 +1434,9 @@ struct GorCopyBindData : public FunctionData {
 // sink to more than one thread.
 struct GorCopyGlobalState : public GlobalFunctionData {
 	std::string path;
-	MD5Context md5;                      // of the bytes written; only fed when META is on
-	unique_ptr<std::ostream> out;        // owns the FileHandle stream
-	unique_ptr<gorz::Writer> gorzWriter; // GORZ only; null for plain GOR
+	MD5Context md5;                         // of the bytes written; only fed when META is on
+	unique_ptr<FileHandleOutputStream> out; // owns the FileHandle stream
+	unique_ptr<gorz::Writer> gorzWriter;    // GORZ only; null for plain GOR
 	std::string firstChrom;
 	int64_t firstPos = 0;
 	std::string lastChrom;
@@ -1655,8 +1669,8 @@ void GorCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		gs.gorzWriter.reset();
 	}
 	if (gs.out) {
-		gs.out->flush();
-		gs.out.reset(); // closes the FileHandle: the data file is complete before any sidecar
+		gs.out->close(); // the data file is complete before any sidecar
+		gs.out.reset();
 	}
 	if (!bd.writeMeta) {
 		return;
